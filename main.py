@@ -177,7 +177,7 @@ from telegram.ext import (
 )
 
 # ================= CONFIG =================
-BOT_TOKEN = os.environ.get("8372943176:AAEjsYr5SECYq3u7iWH5WX7lZg5bUz24PdI", "")
+BOT_TOKEN = os.environ.get("8426456863:AAH986HdotZusBc385uNoUTobBVxtPYoS5A", "")
 ADMIN_ID = int(os.environ.get("6234222988", "0"))
 
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t")
