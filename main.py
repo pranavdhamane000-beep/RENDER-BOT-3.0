@@ -1,0 +1,1001 @@
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+import threading
+import sqlite3
+from contextlib import contextmanager
+
+# ================= HEALTH SERVER FOR RENDER =================
+from flask import Flask, render_template_string, jsonify
+app = Flask(__name__)
+
+# Global variables for web dashboard
+start_time = time.time()
+bot_username = "TelegramBot"
+
+@app.route('/')
+def home():
+    html_content = """
+    <!DOCTYPE html>
+<html>
+<head>
+    <title>🤖 Telegram File Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            margin: 0; 
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+        }
+        .container { 
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+        }
+        h1 { color: white; margin-top: 0; font-size: 1.5rem; }
+        .status { 
+            background: rgba(0, 255, 0, 0.2); 
+            padding: 10px; 
+            border-radius: 8px; 
+            margin: 10px 0;
+            border-left: 4px solid #00ff00;
+        }
+        .info { 
+            background: rgba(255, 255, 255, 0.1);
+            padding: 10px;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+        a { 
+            color: #FFD700; 
+            text-decoration: none; 
+        }
+        .btn {
+            display: inline-block;
+            background: #4CAF50;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            margin: 5px;
+            font-size: 0.9rem;
+        }
+        .warning {
+            background: rgba(255, 165, 0, 0.2);
+            border-left: 4px solid #ffa500;
+            padding: 10px;
+            border-radius: 8px;
+            margin: 10px 0;
+            font-size: 0.9rem;
+        }
+        code {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+        ul { padding-left: 20px; }
+        li { margin: 5px 0; }
+        .error {
+            background: rgba(255, 0, 0, 0.2);
+            border-left: 4px solid #ff0000;
+            padding: 10px;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Telegram File Bot</h1>
+        <div class="status">
+            <h3>✅ Status: <strong>ACTIVE</strong></h3>
+            <p>Bot is running on Render</p>
+            <p>Uptime: {{ uptime }}</p>
+            <p>Files in DB: {{ file_count }}</p>
+        </div>
+        
+        <div class="info">
+            <h3>📊 Bot Information</h3>
+            <ul>
+                <li>Service: <strong>Render Web Service</strong></li>
+                <li>Bot: <strong>@{{ bot_username }}</strong></li>
+                <li>Storage: <strong>SQLite Database</strong></li>
+            </ul>
+        </div>
+        
+        <div class="warning">
+            <h3>⚠️ Important Notes</h3>
+            <ul>
+                <li><strong>🎥 Playable:</strong> MP4, MOV, M4V (sent as videos)</li>
+                <li><strong>📁 Download only:</strong> MKV, AVI, WEBM (sent as documents)</li>
+                <li><strong>💾 Storage:</strong> Database persists between deployments</li>
+            </ul>
+        </div>
+        
+        <div class="info">
+            <h3>📞 Start Bot</h3>
+            <p><a href="https://t.me/{{ bot_username }}" target="_blank" class="btn">Start @{{ bot_username }}</a></p>
+        </div>
+        
+        {% if error %}
+        <div class="error">
+            <h3>⚠️ System Notice</h3>
+            <p>{{ error }}</p>
+        </div>
+        {% endif %}
+        
+        <footer style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 10px; font-size: 0.8rem;">
+            <small>Render • {{ current_time }} • v1.0</small>
+        </footer>
+    </div>
+</body>
+</html>
+    """
+    
+    uptime_seconds = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+    
+    # Get file count from database
+    file_count = 0
+    try:
+        from database import get_file_count
+        file_count = get_file_count()
+    except:
+        pass
+    
+    # Check for channel access issues
+    error = None
+    try:
+        import os
+        if not os.environ.get("BOT_TOKEN"):
+            error = "BOT_TOKEN not set in environment"
+    except:
+        pass
+    
+    return render_template_string(html_content, 
+                                  bot_username=bot_username,
+                                  uptime=uptime_str,
+                                  current_time=datetime.now().strftime("%H:%M:%S"),
+                                  file_count=file_count,
+                                  error=error)
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "OK", 
+        "timestamp": datetime.now().isoformat(),
+        "service": "telegram-file-bot",
+        "uptime": str(timedelta(seconds=int(time.time() - start_time))),
+        "database": "sqlite"
+    }), 200
+
+@app.route('/ping')
+def ping():
+    return "pong", 200
+
+def run_flask_thread():
+    """Run Flask server in a thread for Render"""
+    port = int(os.environ.get('PORT', 10000))
+    
+    # Disable verbose logging
+    import warnings
+    warnings.filterwarnings("ignore")
+    
+    import logging as flask_logging
+    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
+    flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
+    
+    # Use threaded=True for Render compatibility
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
+# ===========================================================
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    Dispatcher
+)
+
+# ================= CONFIG =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t")
+CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web")
+
+# SQLite database for persistent storage
+DB_PATH = Path("file_bot.db")
+DELETE_AFTER = 600  # 10 minutes
+TIMEOUT = 30
+MAX_STORED_FILES = 100
+AUTO_CLEANUP_DAYS = 7
+
+# Playable formats
+PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
+PLAYABLE_MIME = {"video/mp4", "video/quicktime", "video/mpeg"}
+
+# All video extensions
+ALL_VIDEO_EXTS = {
+    "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", 
+    "3gp", "wmv", "mpg", "mpeg"
+}
+
+# MIME types for video detection
+VIDEO_MIME_TYPES = {
+    "video/mp4", "video/x-matroska", "video/quicktime",
+    "video/x-msvideo", "video/webm", "video/x-flv", "video/3gpp",
+    "video/x-ms-wmv", "video/mpeg"
+}
+# =========================================
+
+# Simple logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+log = logging.getLogger(__name__)
+
+# ================= DATABASE =================
+class Database:
+    def __init__(self, db_path: Path = DB_PATH):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize database with required tables"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            # Files table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT,
+                    is_video INTEGER DEFAULT 0,
+                    file_size INTEGER DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 0
+                )
+            ''')
+            # Cache table for membership checks
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS membership_cache (
+                    user_id INTEGER,
+                    channel TEXT,
+                    is_member INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, channel)
+                )
+            ''')
+            # Create indexes
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
+            conn.commit()
+    
+    @contextmanager
+    def get_connection(self):
+        """Get a database connection with automatic cleanup"""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def save_file(self, file_id: str, file_info: dict) -> str:
+        """Save file info and return generated ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Generate ID
+            cursor.execute("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files")
+            max_id = cursor.fetchone()[0]
+            new_id = str(max_id + 1)
+            
+            cursor.execute('''
+                INSERT INTO files (id, file_id, file_name, mime_type, is_video, file_size)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                new_id,
+                file_id,
+                file_info.get('file_name', ''),
+                file_info.get('mime_type', ''),
+                1 if file_info.get('is_video', False) else 0,
+                file_info.get('size', 0)
+            ))
+            
+            # Cleanup old files if needed
+            self.cleanup_old_files()
+            
+            conn.commit()
+            return new_id
+    
+    def get_file(self, file_id: str) -> Optional[dict]:
+        """Get file info by ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_id, file_name, mime_type, is_video, file_size, timestamp
+                FROM files WHERE id = ?
+            ''', (file_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                return {
+                    'file_id': row[0],
+                    'file_name': row[1],
+                    'mime_type': row[2],
+                    'is_video': bool(row[3]),
+                    'size': row[4],
+                    'timestamp': row[5]
+                }
+            return None
+    
+    def file_exists(self, file_id: str) -> bool:
+        """Check if file exists"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM files WHERE id = ?", (file_id,))
+            return cursor.fetchone() is not None
+    
+    def cleanup_old_files(self):
+        """Remove files older than AUTO_CLEANUP_DAYS"""
+        if AUTO_CLEANUP_DAYS <= 0:
+            return
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE timestamp < datetime('now', ?)
+            ''', (f'-{AUTO_CLEANUP_DAYS} days',))
+            
+            deleted = cursor.rowcount
+            if deleted > 0:
+                log.info(f"Auto-cleanup removed {deleted} old files")
+            
+            # Also limit total files
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE id NOT IN (
+                    SELECT id FROM files 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (MAX_STORED_FILES,))
+            
+            if cursor.rowcount > 0:
+                log.info(f"Limited files to {MAX_STORED_FILES}")
+            
+            conn.commit()
+    
+    def get_file_count(self) -> int:
+        """Get total number of files"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM files")
+            return cursor.fetchone()[0]
+    
+    def cache_membership(self, user_id: int, channel: str, is_member: bool):
+        """Cache membership check result"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO membership_cache (user_id, channel, is_member, timestamp)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, channel, 1 if is_member else 0))
+            conn.commit()
+    
+    def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
+        """Get cached membership result (valid for 5 minutes)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT is_member FROM membership_cache 
+                WHERE user_id = ? AND channel = ? 
+                AND timestamp > datetime('now', '-5 minutes')
+            ''', (user_id, channel))
+            row = cursor.fetchone()
+            return bool(row[0]) if row else None
+
+# Initialize database
+db = Database()
+
+# For backward compatibility with web dashboard
+def get_file_count():
+    return db.get_file_count()
+
+# ============ MEMBERSHIP CHECK ============
+def is_member_sync(bot, channel: str, user_id: int) -> Optional[bool]:
+    """Synchronous membership check with caching"""
+    # Check cache first
+    cached = db.get_cached_membership(user_id, channel)
+    if cached is not None:
+        return cached
+    
+    chat_id = f"@{channel}" if not channel.startswith("@") else channel
+    
+    try:
+        member = bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        is_member = member.status in ("member", "administrator", "creator")
+        db.cache_membership(user_id, channel, is_member)
+        return is_member
+    except Exception as e:
+        err = str(e).lower()
+        if "user not found" in err or "chat not found" in err:
+            db.cache_membership(user_id, channel, False)
+            return False
+        elif "forbidden" in err:
+            # Bot doesn't have permission to check membership
+            log.warning(f"Bot cannot check membership in {channel}: {e}")
+            # Don't cache this - we don't know the actual status
+            return None
+        else:
+            log.warning(f"Membership check failed for {channel}: {e}")
+            return None
+
+def check_membership_sync(bot, user_id: int) -> Dict[str, Any]:
+    """Synchronous membership check for both channels"""
+    result = {
+        'channel1': False,
+        'channel2': False,
+        'all_joined': False,
+        'errors': []
+    }
+    
+    try:
+        # Check first channel
+        ch1 = is_member_sync(bot, CHANNEL_1, user_id)
+        if ch1 is None:
+            result['errors'].append(f"Cannot check @{CHANNEL_1}")
+            ch1 = False  # Default to False for security
+        
+        # Check second channel
+        ch2 = is_member_sync(bot, CHANNEL_2, user_id)
+        if ch2 is None:
+            result['errors'].append(f"Cannot check @{CHANNEL_2}")
+            ch2 = False  # Default to False for security
+        
+        result['channel1'] = ch1
+        result['channel2'] = ch2
+        result['all_joined'] = ch1 and ch2
+        
+    except Exception as e:
+        log.error(f"Membership check error: {e}")
+        result['errors'].append(str(e))
+    
+    return result
+
+# ============ VIDEO DETECTION ============
+def is_video_file(document) -> bool:
+    """Check if document is a video file"""
+    if not document:
+        return False
+    
+    # Check mime type
+    mime = getattr(document, 'mime_type', '').lower()
+    if mime:
+        for video_mime in VIDEO_MIME_TYPES:
+            if video_mime in mime:
+                return True
+    
+    # Check file extension
+    filename = getattr(document, 'file_name', '').lower()
+    if filename:
+        ext = filename.split('.')[-1] if '.' in filename else ''
+        if ext in ALL_VIDEO_EXTS:
+            return True
+    
+    return False
+
+def should_send_as_video(file_info: Dict[str, Any]) -> Tuple[bool, bool]:
+    """
+    Determine if file should be sent as playable video
+    Returns: (send_as_video, supports_streaming)
+    """
+    filename = file_info.get('file_name', '').lower()
+    mime_type = file_info.get('mime_type', '').lower()
+    
+    # Check by mime type
+    if mime_type:
+        if 'video/mp4' in mime_type:
+            return True, True
+        elif 'video/quicktime' in mime_type or 'video/mpeg' in mime_type:
+            return True, True
+    
+    # Check by extension
+    ext = filename.split('.')[-1] if '.' in filename else ''
+    if ext in PLAYABLE_EXTS:
+        return True, True
+    
+    return False, False
+
+# ============ DELETE JOB ============
+def delete_job(context: CallbackContext):
+    """Delete message"""
+    job = context.job
+    chat_id = job.context.get("chat")
+    message_id = job.context.get("msg")
+    
+    if not chat_id or not message_id:
+        return
+    
+    try:
+        context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+# ============ ERROR HANDLER ============
+def error_handler(update: object, context: CallbackContext):
+    """Error handler"""
+    log.error(f"Error: {context.error}", exc_info=False)
+
+# ============ CLEANUP COMMAND ============
+def cleanup(update: Update, context: CallbackContext):
+    """Cleanup command - only command besides start/upload"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+            days = max(1, min(days, 30))
+        except ValueError:
+            update.message.reply_text("Usage: /cleanup [days=7]")
+            return
+    
+    try:
+        # Run cleanup
+        db.cleanup_old_files()
+        
+        # Get new count
+        file_count = db.get_file_count()
+        
+        msg = f"🧹 Cleanup complete\n"
+        msg += f"Files retained: {file_count}\n"
+        msg += f"Old files (> {days} days) removed"
+        
+        update.message.reply_text(msg)
+        
+    except Exception as e:
+        update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
+
+# ============ START COMMAND ============
+def start(update: Update, context: CallbackContext):
+    """Handle /start"""
+    try:
+        if not update.message:
+            return
+        
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        args = context.args
+        
+        if not args:
+            update.message.reply_text(
+                "🤖 File Sharing Bot\n\n"
+                "🔗 Use admin-provided links\n"
+                "📢 Join channels to access files\n\n"
+                f"Join:\n"
+                f"1. @{CHANNEL_1}\n"
+                f"2. @{CHANNEL_2}"
+            )
+            return
+        
+        key = args[0]
+        
+        # Check if file exists
+        file_info = db.get_file(key)
+        if not file_info:
+            update.message.reply_text("❌ File not found or expired")
+            return
+        
+        # Check membership (SYNCHRONOUS)
+        result = check_membership_sync(context.bot, user_id)
+        
+        if not result['all_joined']:
+            # Build missing channels list
+            missing = []
+            if not result['channel1']:
+                missing.append(f"@{CHANNEL_1}")
+            if not result['channel2']:
+                missing.append(f"@{CHANNEL_2}")
+            
+            keyboard = []
+            text = "📢 Join these channels to access files:\n"
+            
+            if not result['channel1']:
+                text += f"\n• @{CHANNEL_1}"
+                keyboard.append([InlineKeyboardButton("Join Channel 1", url=f"https://t.me/{CHANNEL_1.replace('@', '')}")])
+            
+            if not result['channel2']:
+                text += f"\n• @{CHANNEL_2}"
+                keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
+            
+            # Show errors if any
+            if result['errors']:
+                text += f"\n\n⚠️ Note: {', '.join(result['errors'])}"
+            
+            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
+            
+            update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            return
+        
+        # Send file
+        filename = file_info.get('file_name', 'file')
+        send_as_video, supports_streaming = should_send_as_video(file_info)
+        
+        try:
+            if send_as_video and file_info.get('is_video'):
+                sent_msg = context.bot.send_video(
+                    chat_id=chat_id,
+                    video=file_info["file_id"],
+                    caption=f"📹 {filename}",
+                    supports_streaming=supports_streaming,
+                    read_timeout=TIMEOUT,
+                    write_timeout=TIMEOUT
+                )
+            else:
+                sent_msg = context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 {filename}",
+                    read_timeout=TIMEOUT,
+                    write_timeout=TIMEOUT
+                )
+        except Exception as e:
+            log.error(f"Send failed: {e}")
+            update.message.reply_text("❌ Failed to send file")
+            return
+        
+        # Schedule deletion
+        context.job_queue.run_once(
+            delete_job,
+            DELETE_AFTER,
+            context={"chat": chat_id, "msg": sent_msg.message_id}
+        )
+        
+        # Send auto-delete warning
+        warn = update.message.reply_text(
+            f"✅ File sent\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes"
+        )
+        
+        context.job_queue.run_once(
+            delete_job,
+            DELETE_AFTER + 30,
+            context={"chat": chat_id, "msg": warn.message_id}
+        )
+        
+    except Exception as e:
+        log.error(f"Start error: {e}")
+        if update.message:
+            update.message.reply_text("❌ Error processing request")
+
+# ============ CALLBACK ============
+def check_join(update: Update, context: CallbackContext):
+    """Handle check membership callback"""
+    try:
+        query = update.callback_query
+        if not query:
+            return
+        query.answer()
+        
+        user_id = query.from_user.id
+        data_parts = query.data.split("|")
+        
+        if len(data_parts) != 2:
+            return
+        
+        _, key = data_parts
+        
+        # Check if file exists
+        file_info = db.get_file(key)
+        if not file_info:
+            query.edit_message_text("❌ File expired")
+            return
+        
+        # Check membership (SYNCHRONOUS)
+        result = check_membership_sync(context.bot, user_id)
+        
+        if not result['all_joined']:
+            # Update the message with current status
+            text = "❌ Still not joined:\n"
+            if not result['channel1']:
+                text += f"\n• @{CHANNEL_1}"
+            if not result['channel2']:
+                text += f"\n• @{CHANNEL_2}"
+            
+            if result['errors']:
+                text += f"\n\n⚠️ {', '.join(result['errors'])}"
+            
+            keyboard = []
+            if not result['channel1']:
+                keyboard.append([InlineKeyboardButton("Join Channel 1", url=f"https://t.me/{CHANNEL_1.replace('@', '')}")])
+            if not result['channel2']:
+                keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
+            keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
+            
+            query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            return
+        
+        # Send file
+        filename = file_info.get('file_name', 'file')
+        send_as_video, supports_streaming = should_send_as_video(file_info)
+        
+        try:
+            if send_as_video and file_info.get('is_video'):
+                sent_msg = context.bot.send_video(
+                    chat_id=query.message.chat_id,
+                    video=file_info["file_id"],
+                    caption=f"📹 {filename}",
+                    supports_streaming=supports_streaming
+                )
+            else:
+                sent_msg = context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 {filename}"
+                )
+        except Exception as e:
+            query.edit_message_text("❌ Failed to send file")
+            return
+        
+        query.edit_message_text("✅ Access granted! File sent.")
+        
+        # Schedule deletion
+        context.job_queue.run_once(
+            delete_job,
+            DELETE_AFTER,
+            context={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+        )
+        
+    except Exception as e:
+        log.error(f"Callback error: {e}")
+        if update.callback_query:
+            update.callback_query.answer("Error occurred", show_alert=True)
+
+# ============ UPLOAD ============
+def upload(update: Update, context: CallbackContext):
+    """Handle file uploads (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    try:
+        video = update.message.video
+        document = update.message.document
+        
+        file_id = None
+        filename = None
+        mime_type = None
+        file_size = 0
+        is_video = False
+        
+        if video:
+            # Video message (always playable)
+            file_id = video.file_id
+            filename = getattr(video, 'file_name', f'video_{int(time.time())}.mp4')
+            mime_type = getattr(video, 'mime_type', 'video/mp4')
+            file_size = getattr(video, 'file_size', 0)
+            is_video = True
+            
+        elif document and is_video_file(document):
+            file_id = document.file_id
+            filename = getattr(document, 'file_name', f'file_{int(time.time())}')
+            mime_type = getattr(document, 'mime_type', '')
+            file_size = getattr(document, 'file_size', 0)
+            
+            # Check if playable
+            filename_lower = filename.lower()
+            ext = filename_lower.split('.')[-1] if '.' in filename_lower else ''
+            
+            if ext in {'mkv', 'avi', 'webm', 'flv'}:
+                # Non-playable formats
+                is_video = False
+                update.message.reply_text(
+                    "⚠️ Non-playable video format (sent as document)\n"
+                    f"Format: {ext.upper()}\n"
+                    "Note: Users will download this file"
+                )
+            else:
+                # Check if playable format
+                send_as_video, _ = should_send_as_video({
+                    'file_name': filename,
+                    'mime_type': mime_type
+                })
+                is_video = send_as_video
+                
+        else:
+            update.message.reply_text(
+                "❌ Send a video file\n\n"
+                "🎥 Playable (sent as video):\n"
+                "• MP4, MOV, M4V, MPG, MPEG\n\n"
+                "📁 Download only (sent as document):\n"
+                "• MKV, AVI, WEBM, FLV\n\n"
+                "📦 Max: 2GB (Telegram limit)"
+            )
+            return
+        
+        # Save to database
+        file_info = {
+            'file_name': filename,
+            'mime_type': mime_type,
+            'is_video': is_video,
+            'size': file_size
+        }
+        
+        key = db.save_file(file_id, file_info)
+        
+        # Generate link
+        try:
+            bot_user = context.bot.get_me()
+            global bot_username
+            bot_username = bot_user.username
+            link = f"https://t.me/{bot_username}?start={key}"
+            
+            file_type = "🎥 Video" if is_video else "📁 Document"
+            update.message.reply_text(
+                f"✅ Uploaded\n"
+                f"ID: <code>{key}</code>\n"
+                f"Name: {filename}\n"
+                f"Type: {file_type}\n"
+                f"Size: {file_size/1024/1024:.1f} MB\n\n"
+                f"🔗 Link:\n<code>{link}</code>",
+                parse_mode='HTML'
+            )
+            
+        except Exception as e:
+            update.message.reply_text(f"✅ Saved as {key}\nError: {str(e)[:100]}")
+            
+    except Exception as e:
+        log.error(f"Upload error: {e}")
+        update.message.reply_text("❌ Upload failed")
+
+# ============ STATS COMMAND ============
+def stats(update: Update, context: CallbackContext):
+    """Show bot statistics (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    try:
+        file_count = db.get_file_count()
+        
+        # Get database size
+        db_size = os.path.getsize(DB_PATH) if DB_PATH.exists() else 0
+        
+        # Get uptime
+        uptime_seconds = time.time() - start_time
+        uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+        
+        message = (
+            f"📊 Bot Statistics\n\n"
+            f"🤖 Bot: @{bot_username}\n"
+            f"⏱️ Uptime: {uptime_str}\n"
+            f"📁 Files: {file_count}\n"
+            f"💾 DB Size: {db_size/1024:.1f} KB\n"
+            f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days\n"
+            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n\n"
+            f"📺 Channels:\n"
+            f"1. @{CHANNEL_1}\n"
+            f"2. @{CHANNEL_2}"
+        )
+        
+        update.message.reply_text(message)
+        
+    except Exception as e:
+        update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+# ============ MAIN FUNCTION ============
+def main():
+    """Main function for Render"""
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN is not set!")
+        print("\n📋 SETUP FOR RENDER:")
+        print("1. Create Web Service on Render")
+        print("2. Add Environment Variables:")
+        print("   - BOT_TOKEN: from @BotFather")
+        print("   - ADMIN_ID: your Telegram ID")
+        print("   - CHANNEL_1: first channel username (without @)")
+        print("   - CHANNEL_2: second channel username (without @)")
+        print("3. Build Command: pip install -r requirements.txt")
+        print("4. Start Command: python main.py")
+        sys.exit(1)
+    
+    # Start Flask in a thread for Render compatibility
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    flask_thread.start()
+    
+    print("\n" + "="*50)
+    print("🤖 TELEGRAM FILE BOT")
+    print("="*50)
+    print(f"👤 Admin: {ADMIN_ID}")
+    print(f"📺 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
+    print(f"💾 Storage: SQLite database")
+    print(f"📁 Files in DB: {db.get_file_count()}")
+    print(f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days")
+    print("="*50 + "\n")
+    
+    # Health check for channels
+    print("🔍 Checking channel access...")
+    try:
+        # Create a temporary updater just for checking
+        from telegram import Bot
+        temp_bot = Bot(token=BOT_TOKEN)
+        
+        for i, channel in enumerate([CHANNEL_1, CHANNEL_2], 1):
+            try:
+                chat = temp_bot.get_chat(f"@{channel}")
+                print(f"✅ Channel {i}: @{channel} - {chat.title}")
+            except Exception as e:
+                print(f"⚠️ Channel {i}: @{channel} - Cannot access: {str(e)[:100]}")
+    except Exception as e:
+        print(f"⚠️ Channel check failed: {e}")
+    
+    print("\n🚀 Starting bot...")
+    
+    try:
+        # Create Telegram updater
+        updater = Updater(BOT_TOKEN, use_context=True)
+        dp = updater.dispatcher
+        
+        # Add handlers
+        dp.add_error_handler(error_handler)
+        dp.add_handler(CommandHandler("start", start))
+        dp.add_handler(CommandHandler("cleanup", cleanup))
+        dp.add_handler(CommandHandler("stats", stats))  # New stats command
+        dp.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
+        
+        # Upload handler (admin only)
+        upload_filter = Filters.VIDEO | Filters.Document.ALL
+        dp.add_handler(MessageHandler(upload_filter & Filters.user(ADMIN_ID), upload))
+        
+        # Start polling
+        updater.start_polling()
+        print("✅ Bot started successfully!")
+        
+        # Update bot username for web dashboard
+        global bot_username
+        bot_username = updater.bot.username
+        print(f"🤖 Bot username: @{bot_username}")
+        
+        updater.idle()  # Keep bot running
+        
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"\n💥 Bot crashed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
