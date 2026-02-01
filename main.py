@@ -1,17 +1,32 @@
-# ========== PATCH FOR PYTHON 3.13 COMPATIBILITY ==========
+# ========== COMPLETE PATCH FOR PYTHON 3.13 COMPATIBILITY ==========
 # This MUST be at the VERY TOP of the file, before ANY other imports
 import sys
 
-# Create dummy imghdr module for Python 3.13
-# imghdr was deprecated in Python 3.11 and removed in Python 3.13
+# Python 3.13 removed these modules. Create minimal dummies for compatibility.
+
+# 1. Patch urllib3
+class DummyUrllib3:
+    class exceptions:
+        class ReadTimeoutError(Exception): pass
+        class ConnectTimeoutError(Exception): pass
+        class SSLError(Exception): pass
+    
+    def __getattr__(self, name):
+        return DummyUrllib3()
+
+sys.modules['urllib3'] = DummyUrllib3()
+
+# 2. Patch imghdr
 class DummyImghdr:
     @staticmethod
     def what(file, h=None):
-        """Minimal implementation - returns None for all files."""
         return None
 
-# Register the dummy module before any imports happen
 sys.modules['imghdr'] = DummyImghdr()
+
+# 3. Patch other potentially removed modules
+sys.modules['crypt'] = type(sys)('crypt')
+sys.modules['optparse'] = type(sys)('optparse')
 # ========== END PATCH ==========
 
 
