@@ -1,32 +1,20 @@
-# ========== COMPLETE PATCH FOR PYTHON 3.13 COMPATIBILITY ==========
-# This MUST be at the VERY TOP of the file, before ANY other imports
+# ========== PATCH FOR PYTHON 3.13 ==========
 import sys
 
-# Python 3.13 removed these modules. Create minimal dummies for compatibility.
+# ONLY patch modules that were REMOVED from Python 3.13 standard library
 
-# 1. Patch urllib3
-class DummyUrllib3:
-    class exceptions:
-        class ReadTimeoutError(Exception): pass
-        class ConnectTimeoutError(Exception): pass
-        class SSLError(Exception): pass
-    
-    def __getattr__(self, name):
-        return DummyUrllib3()
+# 1. imghdr - REMOVED in Python 3.13
+sys.modules['imghdr'] = type(sys)('imghdr')
+sys.modules['imghdr'].what = lambda file, h=None: None
 
-sys.modules['urllib3'] = DummyUrllib3()
-
-# 2. Patch imghdr
-class DummyImghdr:
-    @staticmethod
-    def what(file, h=None):
-        return None
-
-sys.modules['imghdr'] = DummyImghdr()
-
-# 3. Patch other potentially removed modules
+# 2. crypt - REMOVED in Python 3.13  
 sys.modules['crypt'] = type(sys)('crypt')
+
+# 3. optparse - REMOVED in Python 3.13
 sys.modules['optparse'] = type(sys)('optparse')
+
+# DO NOT patch urllib3 - python-telegram-bot has its own version!
+# DO NOT patch any other modules unless you get specific errors
 # ========== END PATCH ==========
 
 
