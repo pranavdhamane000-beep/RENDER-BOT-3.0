@@ -1,3 +1,20 @@
+# ========== PATCH FOR PYTHON 3.13 COMPATIBILITY ==========
+# This MUST be at the VERY TOP of the file, before ANY other imports
+import sys
+
+# Create dummy imghdr module for Python 3.13
+# imghdr was deprecated in Python 3.11 and removed in Python 3.13
+class DummyImghdr:
+    @staticmethod
+    def what(file, h=None):
+        """Minimal implementation - returns None for all files."""
+        return None
+
+# Register the dummy module before any imports happen
+sys.modules['imghdr'] = DummyImghdr()
+# ========== END PATCH ==========
+
+
 import asyncio
 import json
 import logging
