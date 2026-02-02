@@ -1,21 +1,3 @@
-# ========== PATCH FOR PYTHON 3.13 ==========
-import sys
-
-# ONLY patch modules that were REMOVED from Python 3.13 standard library
-
-# 1. imghdr - REMOVED in Python 3.13
-sys.modules['imghdr'] = type(sys)('imghdr')
-sys.modules['imghdr'].what = lambda file, h=None: None
-
-# 2. crypt - REMOVED in Python 3.13  
-sys.modules['crypt'] = type(sys)('crypt')
-
-# 3. optparse - REMOVED in Python 3.13
-sys.modules['optparse'] = type(sys)('optparse')
-
-# DO NOT patch urllib3 - python-telegram-bot has its own version!
-# DO NOT patch any other modules unless you get specific errors
-# ========== END PATCH ==========
 
 
 import asyncio
