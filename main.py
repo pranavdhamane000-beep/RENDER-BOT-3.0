@@ -1,5 +1,3 @@
-
-
 import asyncio
 import json
 import logging
@@ -990,10 +988,24 @@ def main():
         bot_username = updater.bot.username
         print(f"🤖 Bot username: @{bot_username}")
         
-        updater.idle()  # Keep bot running
+        # Bot information for web interface
+        print("\n🌐 Web Server Information:")
+        print(f"   • Health endpoint: http://localhost:{os.environ.get('PORT', 10000)}/health")
+        print(f"   • Dashboard: http://localhost:{os.environ.get('PORT', 10000)}/")
+        print(f"   • Ping: http://localhost:{os.environ.get('PORT', 10000)}/ping")
+        print("\n📱 Bot is ready to receive commands!")
+        print("   • /start - Start bot")
+        print("   • /upload - Admin upload (send video/document)")
+        print("   • /cleanup - Clean old files")
+        print("   • /stats - Show statistics")
+        print("="*50)
+        
+        # Keep the bot running
+        updater.idle()
         
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
+        sys.exit(0)
     except Exception as e:
         print(f"\n💥 Bot crashed: {e}")
         traceback.print_exc()
