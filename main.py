@@ -204,13 +204,13 @@ def run_flask_thread():
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    Filters,
-    CallbackContext,
-    Dispatcher
+    filters,
+    ContextTypes,
+    CallbackContext
 )
 
 # ================= CONFIG =================
@@ -533,27 +533,27 @@ def should_send_as_video(file_info: Dict[str, Any]) -> Tuple[bool, bool]:
     return False, False
 
 # ============ DELETE JOB ============
-def delete_job(context: CallbackContext):
+async def delete_job(context: CallbackContext):
     """Delete message"""
     job = context.job
-    chat_id = job.context.get("chat")
-    message_id = job.context.get("msg")
+    chat_id = job.data.get("chat")
+    message_id = job.data.get("msg")
     
     if not chat_id or not message_id:
         return
     
     try:
-        context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         pass
 
 # ============ ERROR HANDLER ============
-def error_handler(update: object, context: CallbackContext):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=False)
 
 # ============ CLEANUP COMMAND ============
-def cleanup(update: Update, context: CallbackContext):
+async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cleanup command - only command besides start/upload"""
     if update.effective_user.id != ADMIN_ID:
         return
@@ -564,7 +564,7 @@ def cleanup(update: Update, context: CallbackContext):
             days = int(context.args[0])
             days = max(1, min(days, 30))
         except ValueError:
-            update.message.reply_text("Usage: /cleanup [days=7]")
+            await update.message.reply_text("Usage: /cleanup [days=7]")
             return
     
     try:
@@ -578,13 +578,13 @@ def cleanup(update: Update, context: CallbackContext):
         msg += f"Files retained: {file_count}\n"
         msg += f"Old files (> {days} days) removed"
         
-        update.message.reply_text(msg)
+        await update.message.reply_text(msg)
         
     except Exception as e:
-        update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
+        await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
 
 # ============ START COMMAND ============
-def start(update: Update, context: CallbackContext):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start"""
     try:
         if not update.message:
@@ -595,7 +595,7 @@ def start(update: Update, context: CallbackContext):
         args = context.args
         
         if not args:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "🤖 File Sharing Bot\n\n"
                 "🔗 Use admin-provided links\n"
                 "📢 Join channels to access files\n\n"
@@ -610,7 +610,7 @@ def start(update: Update, context: CallbackContext):
         # Check if file exists
         file_info = db.get_file(key)
         if not file_info:
-            update.message.reply_text("❌ File not found or expired")
+            await update.message.reply_text("❌ File not found or expired")
             return
         
         # Check membership (SYNCHRONOUS)
@@ -641,7 +641,7 @@ def start(update: Update, context: CallbackContext):
             
             keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
             
-            update.message.reply_text(
+            await update.message.reply_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
@@ -654,7 +654,7 @@ def start(update: Update, context: CallbackContext):
         
         try:
             if send_as_video and file_info.get('is_video'):
-                sent_msg = context.bot.send_video(
+                sent_msg = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
                     caption=f"📹 {filename}",
@@ -663,7 +663,7 @@ def start(update: Update, context: CallbackContext):
                     write_timeout=TIMEOUT
                 )
             else:
-                sent_msg = context.bot.send_document(
+                sent_msg = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
                     caption=f"📁 {filename}",
@@ -672,40 +672,40 @@ def start(update: Update, context: CallbackContext):
                 )
         except Exception as e:
             log.error(f"Send failed: {e}")
-            update.message.reply_text("❌ Failed to send file")
+            await update.message.reply_text("❌ Failed to send file")
             return
         
         # Schedule deletion
         context.job_queue.run_once(
             delete_job,
             DELETE_AFTER,
-            context={"chat": chat_id, "msg": sent_msg.message_id}
+            data={"chat": chat_id, "msg": sent_msg.message_id}
         )
         
         # Send auto-delete warning
-        warn = update.message.reply_text(
+        warn = await update.message.reply_text(
             f"✅ File sent\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes"
         )
         
         context.job_queue.run_once(
             delete_job,
             DELETE_AFTER + 30,
-            context={"chat": chat_id, "msg": warn.message_id}
+            data={"chat": chat_id, "msg": warn.message_id}
         )
         
     except Exception as e:
         log.error(f"Start error: {e}")
         if update.message:
-            update.message.reply_text("❌ Error processing request")
+            await update.message.reply_text("❌ Error processing request")
 
 # ============ CALLBACK ============
-def check_join(update: Update, context: CallbackContext):
+async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle check membership callback"""
     try:
         query = update.callback_query
         if not query:
             return
-        query.answer()
+        await query.answer()
         
         user_id = query.from_user.id
         data_parts = query.data.split("|")
@@ -718,7 +718,7 @@ def check_join(update: Update, context: CallbackContext):
         # Check if file exists
         file_info = db.get_file(key)
         if not file_info:
-            query.edit_message_text("❌ File expired")
+            await query.edit_message_text("❌ File expired")
             return
         
         # Check membership (SYNCHRONOUS)
@@ -742,7 +742,7 @@ def check_join(update: Update, context: CallbackContext):
                 keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
             keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
             
-            query.edit_message_text(
+            await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='HTML'
@@ -755,38 +755,38 @@ def check_join(update: Update, context: CallbackContext):
         
         try:
             if send_as_video and file_info.get('is_video'):
-                sent_msg = context.bot.send_video(
+                sent_msg = await context.bot.send_video(
                     chat_id=query.message.chat_id,
                     video=file_info["file_id"],
                     caption=f"📹 {filename}",
                     supports_streaming=supports_streaming
                 )
             else:
-                sent_msg = context.bot.send_document(
+                sent_msg = await context.bot.send_document(
                     chat_id=query.message.chat_id,
                     document=file_info["file_id"],
                     caption=f"📁 {filename}"
                 )
         except Exception as e:
-            query.edit_message_text("❌ Failed to send file")
+            await query.edit_message_text("❌ Failed to send file")
             return
         
-        query.edit_message_text("✅ Access granted! File sent.")
+        await query.edit_message_text("✅ Access granted! File sent.")
         
         # Schedule deletion
         context.job_queue.run_once(
             delete_job,
             DELETE_AFTER,
-            context={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+            data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
         )
         
     except Exception as e:
         log.error(f"Callback error: {e}")
         if update.callback_query:
-            update.callback_query.answer("Error occurred", show_alert=True)
+            await update.callback_query.answer("Error occurred", show_alert=True)
 
 # ============ UPLOAD ============
-def upload(update: Update, context: CallbackContext):
+async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file uploads (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
@@ -822,7 +822,7 @@ def upload(update: Update, context: CallbackContext):
             if ext in {'mkv', 'avi', 'webm', 'flv'}:
                 # Non-playable formats
                 is_video = False
-                update.message.reply_text(
+                await update.message.reply_text(
                     "⚠️ Non-playable video format (sent as document)\n"
                     f"Format: {ext.upper()}\n"
                     "Note: Users will download this file"
@@ -836,7 +836,7 @@ def upload(update: Update, context: CallbackContext):
                 is_video = send_as_video
                 
         else:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "❌ Send a video file\n\n"
                 "🎥 Playable (sent as video):\n"
                 "• MP4, MOV, M4V, MPG, MPEG\n\n"
@@ -858,13 +858,13 @@ def upload(update: Update, context: CallbackContext):
         
         # Generate link
         try:
-            bot_user = context.bot.get_me()
+            bot_user = await context.bot.get_me()
             global bot_username
             bot_username = bot_user.username
             link = f"https://t.me/{bot_username}?start={key}"
             
             file_type = "🎥 Video" if is_video else "📁 Document"
-            update.message.reply_text(
+            await update.message.reply_text(
                 f"✅ Uploaded\n"
                 f"ID: <code>{key}</code>\n"
                 f"Name: {filename}\n"
@@ -875,14 +875,14 @@ def upload(update: Update, context: CallbackContext):
             )
             
         except Exception as e:
-            update.message.reply_text(f"✅ Saved as {key}\nError: {str(e)[:100]}")
+            await update.message.reply_text(f"✅ Saved as {key}\nError: {str(e)[:100]}")
             
     except Exception as e:
         log.error(f"Upload error: {e}")
-        update.message.reply_text("❌ Upload failed")
+        await update.message.reply_text("❌ Upload failed")
 
 # ============ STATS COMMAND ============
-def stats(update: Update, context: CallbackContext):
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
@@ -910,10 +910,10 @@ def stats(update: Update, context: CallbackContext):
             f"2. @{CHANNEL_2}"
         )
         
-        update.message.reply_text(message)
+        await update.message.reply_text(message)
         
     except Exception as e:
-        update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 # ============ MAIN FUNCTION ============
 def main():
@@ -948,60 +948,47 @@ def main():
     # Health check for channels
     print("🔍 Checking channel access...")
     try:
-        # Create a temporary updater just for checking
+        # Create a temporary bot just for checking
         from telegram import Bot
-        temp_bot = Bot(token=BOT_TOKEN)
+        import asyncio
         
-        for i, channel in enumerate([CHANNEL_1, CHANNEL_2], 1):
-            try:
-                chat = temp_bot.get_chat(f"@{channel}")
-                print(f"✅ Channel {i}: @{channel} - {chat.title}")
-            except Exception as e:
-                print(f"⚠️ Channel {i}: @{channel} - Cannot access: {str(e)[:100]}")
+        async def check_channels():
+            temp_bot = Bot(token=BOT_TOKEN)
+            for i, channel in enumerate([CHANNEL_1, CHANNEL_2], 1):
+                try:
+                    chat = await temp_bot.get_chat(f"@{channel}")
+                    print(f"✅ Channel {i}: @{channel} - {chat.title}")
+                except Exception as e:
+                    print(f"⚠️ Channel {i}: @{channel} - Cannot access: {str(e)[:100]}")
+        
+        asyncio.run(check_channels())
     except Exception as e:
         print(f"⚠️ Channel check failed: {e}")
     
     print("\n🚀 Starting bot...")
     
     try:
-        # Create Telegram updater
-        updater = Updater(BOT_TOKEN, use_context=True)
-        dp = updater.dispatcher
+        # Create Telegram application
+        application = Application.builder().token(BOT_TOKEN).build()
         
         # Add handlers
-        dp.add_error_handler(error_handler)
-        dp.add_handler(CommandHandler("start", start))
-        dp.add_handler(CommandHandler("cleanup", cleanup))
-        dp.add_handler(CommandHandler("stats", stats))  # New stats command
-        dp.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
+        application.add_error_handler(error_handler)
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("cleanup", cleanup))
+        application.add_handler(CommandHandler("stats", stats))  # New stats command
+        application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
         
         # Upload handler (admin only)
-        upload_filter = Filters.VIDEO | Filters.Document.ALL
-        dp.add_handler(MessageHandler(upload_filter & Filters.user(ADMIN_ID), upload))
+        upload_filter = filters.VIDEO | filters.Document.ALL
+        application.add_handler(MessageHandler(upload_filter & filters.User(ADMIN_ID), upload))
         
         # Start polling
-        updater.start_polling()
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         print("✅ Bot started successfully!")
         
         # Update bot username for web dashboard
         global bot_username
-        bot_username = updater.bot.username
-        print(f"🤖 Bot username: @{bot_username}")
-        
-        # Bot information for web interface
-        print("\n🌐 Web Server Information:")
-        print(f"   • Health endpoint: http://localhost:{os.environ.get('PORT', 10000)}/health")
-        print(f"   • Dashboard: http://localhost:{os.environ.get('PORT', 10000)}/")
-        print(f"   • Ping: http://localhost:{os.environ.get('PORT', 10000)}/ping")
-        print("\n📱 Bot is ready to receive commands!")
-        print("   • /start - Start bot")
-        print("   • /upload - Admin upload (send video/document)")
-        print("   • /cleanup - Clean old files")
-        print("   • /stats - Show statistics")
-        print("="*50)
-        
-        # Keep the bot running
-        updater.idle()
+        # Note: bot_username will be updated when bot.get_me() is called
         
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
