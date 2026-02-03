@@ -913,87 +913,108 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 # ============ MAIN FUNCTION ============
-async def main_async():
-    """Async main function"""
+
+async def bot_main():
+    """Main async bot function"""
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
-        print("\n📋 SETUP FOR RENDER:")
-        print("1. Create Web Service on Render")
-        print("2. Add Environment Variables:")
-        print("   - BOT_TOKEN: from @BotFather")
-        print("   - ADMIN_ID: your Telegram ID")
-        print("   - CHANNEL_1: first channel username (without @)")
-        print("   - CHANNEL_2: second channel username (without @)")
-        print("3. Build Command: pip install -r requirements.txt")
-        print("4. Start Command: python main.py")
         return
-    
+
     print("\n" + "="*50)
     print("🤖 TELEGRAM FILE BOT")
     print("="*50)
-    
+
     try:
         # Create Telegram application
         application = Application.builder().token(BOT_TOKEN).build()
-        
+
         # Add handlers
         application.add_error_handler(error_handler)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("cleanup", cleanup))
         application.add_handler(CommandHandler("stats", stats))
         application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
-        
-        # Upload handler (admin only) - FIXED: filters.Document.ALL -> filters.ATTACHMENT
+
+        # Upload handler (admin only)
         upload_filter = filters.VIDEO | filters.ATTACHMENT
-        application.add_handler(MessageHandler(upload_filter & filters.User(ADMIN_ID), upload))
-        
-        # Start Flask in a thread
-        flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
-        flask_thread.start()
-        
-        # Get bot info
+        application.add_handler(
+            MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
+        )
+
+        # ✅ START BOT (NO run_polling)
+        await application.initialize()
+        await application.start()
+
+        # Get bot info AFTER start
         bot_user = await application.bot.get_me()
         global bot_username
         bot_username = bot_user.username
-        
+
         print(f"👤 Admin: {ADMIN_ID}")
         print(f"📺 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
         print(f"🤖 Bot: @{bot_username}")
         print(f"📁 Files in DB: {db.get_file_count()}")
         print(f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days")
-        print("✅ Bot started successfully!")
-        
-        port = os.environ.get('PORT', 10000)
-        print(f"\n🌐 Web Dashboard: http://localhost:{port}/")
-        print(f"🩺 Health Check: http://localhost:{port}/health")
-        print("="*50)
+        print("🟢 Polling started")
         print("📱 Bot is ready to receive commands!")
-        
-        # Run polling
-        await application.run_polling(allowed_updates=Update.ALL_TYPES, 
-                                      close_loop=False)  # Important: Don't close Flask loop
-        
+
+        # Keep the bot running forever
+        await asyncio.Event().wait()
+
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
     except Exception as e:
         print(f"\n💥 Bot crashed: {e}")
         traceback.print_exc()
 
+def run_flask_sync():
+    """Run Flask WITHOUT asyncio interference"""
+    port = int(os.environ.get('PORT', 10000))
+
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    import logging as flask_logging
+    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
+    flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
+
+    from werkzeug.serving import make_server
+
+    server = make_server('0.0.0.0', port, app, threaded=True)
+    print(f"🌐 Flask server started on port {port}")
+    server.serve_forever()
+
 def main():
     """Main function for Render"""
-    # Create new event loop for Python 3.13 compatibility
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
+    import multiprocessing
+
+    flask_process = multiprocessing.Process(
+        target=run_flask_sync,
+        daemon=True
+    )
+    flask_process.start()
+
+    time.sleep(2)
+
     try:
-        loop.run_until_complete(main_async())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bot_main())
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
     except Exception as e:
         print(f"\n💥 Bot crashed: {e}")
         traceback.print_exc()
     finally:
-        loop.close()
+        if flask_process.is_alive():
+            flask_process.terminate()
+            flask_process.join()
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)
     main()
+
+       
+  
+
