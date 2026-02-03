@@ -914,6 +914,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ MAIN FUNCTION ============
 
+so this is correct?
+import os
+import time
+import threading
 import asyncio
 from telegram import Update
 from telegram.ext import (
@@ -924,20 +928,44 @@ from telegram.ext import (
     filters,
 )
 
-# make sure BOT_TOKEN, ADMIN_ID, handlers exist
+# Make sure these exist
+# BOT_TOKEN, ADMIN_ID, CHANNEL_1, CHANNEL_2
+# Also your handlers: start, cleanup, stats, upload, check_join, error_handler
 
-async def bot_main():
+# ---------------- FLASK SERVER ----------------
+def run_flask_thread():
+    from flask import Flask, jsonify
+    from werkzeug.serving import make_server
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index():
+        return "Bot Web Dashboard ✅"
+
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok", "service": "telegram-bot"}), 200
+
+    @app.route("/ping")
+    def ping():
+        return "pong", 200
+
+    port = int(os.environ.get("PORT", 10000))
+    server = make_server("0.0.0.0", port, app)
+    server.serve_forever()
+
+
+# ---------------- TELEGRAM BOT ----------------
+def start_bot():
+    # ✅ CRITICAL FIX: Check for BOT_TOKEN here too
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
         return
-
-    print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT")
-    print("=" * 50)
-
+    
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
+    # Handlers (must be async functions!)
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cleanup", cleanup))
@@ -950,16 +978,41 @@ async def bot_main():
     )
 
     print("🟢 Bot is running and listening...")
-
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    print("🟢 Press Ctrl+C to stop")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
+# ---------------- MAIN ----------------
 def main():
-    asyncio.run(bot_main())
+    print("\n" + "=" * 50)
+    print("🤖 TELEGRAM FILE BOT")
+    print("=" * 50)
+
+    # ✅ ADD THESE CHECKS
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN is not set!")
+        return
+
+    if not ADMIN_ID or ADMIN_ID == 0:
+        print("❌ ERROR: ADMIN_ID is not set or invalid!")
+        return
+
+    print(f"🟢 Admin ID: {ADMIN_ID}")
+    print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
+
+    # Start Flask in a separate thread
+    print("🟢 Starting Flask web dashboard...")
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    flask_thread.start()
+    time.sleep(1)  # Let Flask initialize
+    print(f"🟢 Flask running on port {os.environ.get('PORT', 10000)}")
+
+    # Start Telegram bot in main thread
+    start_bot()
 
 
 if __name__ == "__main__":
     main()
-
