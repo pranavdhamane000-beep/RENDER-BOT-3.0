@@ -914,7 +914,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ MAIN FUNCTION ============
 
-so this is correct?
+
 import os
 import time
 import threading
