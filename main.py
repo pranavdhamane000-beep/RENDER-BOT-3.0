@@ -151,8 +151,7 @@ def home():
     # Get file count from database
     file_count = 0
     try:
-        from database import get_file_count
-        file_count = get_file_count()
+        file_count = db.get_file_count()
     except:
         pass
     
@@ -209,8 +208,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     filters,
-    ContextTypes,
-    CallbackContext
+    ContextTypes
 )
 
 # ================= CONFIG =================
@@ -423,13 +421,13 @@ class Database:
 # Initialize database
 db = Database()
 
-# For backward compatibility with web dashboard
 def get_file_count():
+    """For web dashboard compatibility"""
     return db.get_file_count()
 
 # ============ MEMBERSHIP CHECK ============
-def is_member_sync(bot, channel: str, user_id: int) -> Optional[bool]:
-    """Synchronous membership check with caching"""
+async def is_member_async(bot, channel: str, user_id: int) -> Optional[bool]:
+    """ASYNCHRONOUS membership check with caching"""
     # Check cache first
     cached = db.get_cached_membership(user_id, channel)
     if cached is not None:
@@ -438,7 +436,7 @@ def is_member_sync(bot, channel: str, user_id: int) -> Optional[bool]:
     chat_id = f"@{channel}" if not channel.startswith("@") else channel
     
     try:
-        member = bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         is_member = member.status in ("member", "administrator", "creator")
         db.cache_membership(user_id, channel, is_member)
         return is_member
@@ -450,14 +448,13 @@ def is_member_sync(bot, channel: str, user_id: int) -> Optional[bool]:
         elif "forbidden" in err:
             # Bot doesn't have permission to check membership
             log.warning(f"Bot cannot check membership in {channel}: {e}")
-            # Don't cache this - we don't know the actual status
             return None
         else:
             log.warning(f"Membership check failed for {channel}: {e}")
             return None
 
-def check_membership_sync(bot, user_id: int) -> Dict[str, Any]:
-    """Synchronous membership check for both channels"""
+async def check_membership_async(bot, user_id: int) -> Dict[str, Any]:
+    """ASYNCHRONOUS membership check for both channels"""
     result = {
         'channel1': False,
         'channel2': False,
@@ -467,16 +464,16 @@ def check_membership_sync(bot, user_id: int) -> Dict[str, Any]:
     
     try:
         # Check first channel
-        ch1 = is_member_sync(bot, CHANNEL_1, user_id)
+        ch1 = await is_member_async(bot, CHANNEL_1, user_id)
         if ch1 is None:
             result['errors'].append(f"Cannot check @{CHANNEL_1}")
-            ch1 = False  # Default to False for security
+            ch1 = False
         
         # Check second channel
-        ch2 = is_member_sync(bot, CHANNEL_2, user_id)
+        ch2 = await is_member_async(bot, CHANNEL_2, user_id)
         if ch2 is None:
             result['errors'].append(f"Cannot check @{CHANNEL_2}")
-            ch2 = False  # Default to False for security
+            ch2 = False
         
         result['channel1'] = ch1
         result['channel2'] = ch2
@@ -533,7 +530,7 @@ def should_send_as_video(file_info: Dict[str, Any]) -> Tuple[bool, bool]:
     return False, False
 
 # ============ DELETE JOB ============
-async def delete_job(context: CallbackContext):
+async def delete_job(context):
     """Delete message"""
     job = context.job
     chat_id = job.data.get("chat")
@@ -613,8 +610,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ File not found or expired")
             return
         
-        # Check membership (SYNCHRONOUS)
-        result = check_membership_sync(context.bot, user_id)
+        # Check membership (ASYNC)
+        result = await check_membership_async(context.bot, user_id)
         
         if not result['all_joined']:
             # Build missing channels list
@@ -721,8 +718,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ File expired")
             return
         
-        # Check membership (SYNCHRONOUS)
-        result = check_membership_sync(context.bot, user_id)
+        # Check membership (ASYNC)
+        result = await check_membership_async(context.bot, user_id)
         
         if not result['all_joined']:
             # Update the message with current status
@@ -916,8 +913,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 # ============ MAIN FUNCTION ============
-def main():
-    """Main function for Render"""
+async def main_async():
+    """Async main function"""
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
         print("\n📋 SETUP FOR RENDER:")
@@ -929,43 +926,11 @@ def main():
         print("   - CHANNEL_2: second channel username (without @)")
         print("3. Build Command: pip install -r requirements.txt")
         print("4. Start Command: python main.py")
-        sys.exit(1)
-    
-    # Start Flask in a thread for Render compatibility
-    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
-    flask_thread.start()
+        return
     
     print("\n" + "="*50)
     print("🤖 TELEGRAM FILE BOT")
     print("="*50)
-    print(f"👤 Admin: {ADMIN_ID}")
-    print(f"📺 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"💾 Storage: SQLite database")
-    print(f"📁 Files in DB: {db.get_file_count()}")
-    print(f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days")
-    print("="*50 + "\n")
-    
-    # Health check for channels
-    print("🔍 Checking channel access...")
-    try:
-        # Create a temporary bot just for checking
-        from telegram import Bot
-        import asyncio
-        
-        async def check_channels():
-            temp_bot = Bot(token=BOT_TOKEN)
-            for i, channel in enumerate([CHANNEL_1, CHANNEL_2], 1):
-                try:
-                    chat = await temp_bot.get_chat(f"@{channel}")
-                    print(f"✅ Channel {i}: @{channel} - {chat.title}")
-                except Exception as e:
-                    print(f"⚠️ Channel {i}: @{channel} - Cannot access: {str(e)[:100]}")
-        
-        asyncio.run(check_channels())
-    except Exception as e:
-        print(f"⚠️ Channel check failed: {e}")
-    
-    print("\n🚀 Starting bot...")
     
     try:
         # Create Telegram application
@@ -975,28 +940,60 @@ def main():
         application.add_error_handler(error_handler)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("cleanup", cleanup))
-        application.add_handler(CommandHandler("stats", stats))  # New stats command
+        application.add_handler(CommandHandler("stats", stats))
         application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
         
-        # Upload handler (admin only)
-        upload_filter = filters.VIDEO | filters.Document.ALL
+        # Upload handler (admin only) - FIXED: filters.Document.ALL -> filters.ATTACHMENT
+        upload_filter = filters.VIDEO | filters.ATTACHMENT
         application.add_handler(MessageHandler(upload_filter & filters.User(ADMIN_ID), upload))
         
-        # Start polling
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Start Flask in a thread
+        flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+        flask_thread.start()
+        
+        # Get bot info
+        bot_user = await application.bot.get_me()
+        global bot_username
+        bot_username = bot_user.username
+        
+        print(f"👤 Admin: {ADMIN_ID}")
+        print(f"📺 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
+        print(f"🤖 Bot: @{bot_username}")
+        print(f"📁 Files in DB: {db.get_file_count()}")
+        print(f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days")
         print("✅ Bot started successfully!")
         
-        # Update bot username for web dashboard
-        global bot_username
-        # Note: bot_username will be updated when bot.get_me() is called
+        port = os.environ.get('PORT', 10000)
+        print(f"\n🌐 Web Dashboard: http://localhost:{port}/")
+        print(f"🩺 Health Check: http://localhost:{port}/health")
+        print("="*50)
+        print("📱 Bot is ready to receive commands!")
+        
+        # Run polling
+        await application.run_polling(allowed_updates=Update.ALL_TYPES, 
+                                      close_loop=False)  # Important: Don't close Flask loop
         
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
-        sys.exit(0)
     except Exception as e:
         print(f"\n💥 Bot crashed: {e}")
         traceback.print_exc()
-        sys.exit(1)
+
+def main():
+    """Main function for Render"""
+    # Create new event loop for Python 3.13 compatibility
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"\n💥 Bot crashed: {e}")
+        traceback.print_exc()
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     main()
