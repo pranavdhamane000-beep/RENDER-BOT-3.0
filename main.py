@@ -915,79 +915,39 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN FUNCTION ============
 
 async def bot_main():
-    """Main async bot function"""
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
         return
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("🤖 TELEGRAM FILE BOT")
-    print("="*50)
+    print("=" * 50)
 
-    try:
-        # Create Telegram application
-        application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-        # Add handlers
-        application.add_error_handler(error_handler)
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("cleanup", cleanup))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
+    # Handlers
+    application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cleanup", cleanup))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
-        # Upload handler (admin only)
-        upload_filter = filters.VIDEO | filters.ATTACHMENT
-        application.add_handler(
-            MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
-        )
+    upload_filter = filters.VIDEO | filters.ATTACHMENT
+    application.add_handler(
+        MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
+    )
 
-        # ✅ START BOT (NO run_polling)
-        await application.initialize()
-        await application.start()
+    print("🟢 Starting polling...")
 
-        # Get bot info AFTER start
-        bot_user = await application.bot.get_me()
-        global bot_username
-        bot_username = bot_user.username
-
-        print(f"👤 Admin: {ADMIN_ID}")
-        print(f"📺 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-        print(f"🤖 Bot: @{bot_username}")
-        print(f"📁 Files in DB: {db.get_file_count()}")
-        print(f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days")
-        print("🟢 Polling started")
-        print("📱 Bot is ready to receive commands!")
-
-        # Keep the bot running forever
-        await asyncio.Event().wait()
-
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-    except Exception as e:
-        print(f"\n💥 Bot crashed: {e}")
-        traceback.print_exc()
-
-def run_flask_sync():
-    """Run Flask WITHOUT asyncio interference"""
-    port = int(os.environ.get('PORT', 10000))
-
-    import warnings
-    warnings.filterwarnings("ignore")
-
-    import logging as flask_logging
-    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
-    flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
-
-    from werkzeug.serving import make_server
-
-    server = make_server('0.0.0.0', port, app, threaded=True)
-    print(f"🌐 Flask server started on port {port}")
-    server.serve_forever()
-
+    # ✅ THIS LINE MAKES THE BOT LISTEN
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
+    )
 def main():
-    """Main function for Render"""
     import multiprocessing
 
+    # Start Flask in separate process
     flask_process = multiprocessing.Process(
         target=run_flask_sync,
         daemon=True
@@ -996,25 +956,10 @@ def main():
 
     time.sleep(2)
 
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(bot_main())
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-    except Exception as e:
-        print(f"\n💥 Bot crashed: {e}")
-        traceback.print_exc()
-    finally:
-        if flask_process.is_alive():
-            flask_process.terminate()
-            flask_process.join()
-
+    # ✅ DO NOT CREATE EVENT LOOP MANUALLY
+    asyncio.run(bot_main())
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
     main()
-
-       
-  
 
