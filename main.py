@@ -914,6 +914,18 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ MAIN FUNCTION ============
 
+import asyncio
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
+
+# make sure BOT_TOKEN, ADMIN_ID, handlers exist
+
 async def bot_main():
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
@@ -937,29 +949,17 @@ async def bot_main():
         MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
     )
 
-    print("🟢 Starting polling...")
+    print("🟢 Bot is running and listening...")
 
-    # ✅ THIS LINE MAKES THE BOT LISTEN
     await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False
+        allowed_updates=Update.ALL_TYPES
     )
+
+
 def main():
-    import multiprocessing
-
-    # Start Flask in separate process
-    flask_process = multiprocessing.Process(
-        target=run_flask_sync,
-        daemon=True
-    )
-    flask_process.start()
-
-    time.sleep(2)
-
-    # ✅ DO NOT CREATE EVENT LOOP MANUALLY
     asyncio.run(bot_main())
+
+
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.set_start_method("spawn", force=True)
     main()
 
