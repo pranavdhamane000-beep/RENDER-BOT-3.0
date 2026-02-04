@@ -269,7 +269,6 @@ class Database:
         """Initialize database with required tables"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Files table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS files (
                     id TEXT PRIMARY KEY,
@@ -282,7 +281,6 @@ class Database:
                     access_count INTEGER DEFAULT 0
                 )
             ''')
-            # Cache table for membership checks
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS membership_cache (
                     user_id INTEGER,
@@ -292,24 +290,24 @@ class Database:
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
-            # Create indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
             conn.commit()
-    
-   @contextmanager
-def get_connection(self):
-    conn = sqlite3.connect(
-        str(self.db_path),
-        timeout=30,
-        check_same_thread=False
-    )
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        yield conn
-    finally:
-        conn.close()
+
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30,
+            check_same_thread=False
+        )
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
+        finally:
+            conn.close()
+
 
     
     def save_file(self, file_id: str, file_info: dict) -> str:
