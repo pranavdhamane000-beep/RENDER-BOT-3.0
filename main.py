@@ -260,6 +260,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # ================= DATABASE =================
+
 class Database:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
@@ -308,37 +309,38 @@ class Database:
         finally:
             conn.close()
 
+    def save_file(self, file_id: str, file_info: dict) -> str:
+        """Save file info and return generated ID"""
+        with db_lock:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
 
-    
-  def save_file(self, file_id: str, file_info: dict) -> str:
-    """Save file info and return generated ID"""
-    with db_lock:
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            # rest of your code here
+                cursor.execute(
+                    "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files"
+                )
+                max_id = cursor.fetchone()[0]
+                new_id = str(max_id + 1)
 
-            # Generate ID
-            cursor.execute("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files")
-            max_id = cursor.fetchone()[0]
-            new_id = str(max_id + 1)
-            
-            cursor.execute('''
-                INSERT INTO files (id, file_id, file_name, mime_type, is_video, file_size)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                new_id,
-                file_id,
-                file_info.get('file_name', ''),
-                file_info.get('mime_type', ''),
-                1 if file_info.get('is_video', False) else 0,
-                file_info.get('size', 0)
-            ))
-            
-            # Cleanup old files if needed
-            
-            
-            conn.commit()
-            return new_id
+                cursor.execute(
+                    '''
+                    INSERT INTO files
+                    (id, file_id, file_name, mime_type, is_video, file_size)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        new_id,
+                        file_id,
+                        file_info.get('file_name', ''),
+                        file_info.get('mime_type', ''),
+                        1 if file_info.get('is_video', False) else 0,
+                        file_info.get('size', 0)
+                    )
+                )
+
+                conn.commit()
+                return new_id
+
+                    
     
     def get_file(self, file_id: str) -> Optional[dict]:
         """Get file info by ID"""
