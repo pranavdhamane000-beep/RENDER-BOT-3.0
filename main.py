@@ -817,13 +817,13 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ext = filename_lower.split('.')[-1] if '.' in filename_lower else ''
             
             if ext in {'mkv', 'avi', 'webm', 'flv'}:
-                # Non-playable formats
                 is_video = False
                 await update.message.reply_text(
                     "⚠️ Non-playable video format (sent as document)\n"
                     f"Format: {ext.upper()}\n"
                     "Note: Users will download this file"
                 )
+
             else:
                 # Check if playable format
                 send_as_video, _ = should_send_as_video({
@@ -845,11 +845,12 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Save to database
         file_info = {
-            'file_name': filename,
-            'mime_type': mime_type,
-            'is_video': is_video,
-            'size': file_size
-        }
+    'file_name': filename or "unknown_file",
+    'mime_type': mime_type or "",
+    'is_video': bool(is_video),
+    'size': int(file_size or 0)
+}
+
         
         key = db.save_file(file_id, file_info)
         
@@ -874,9 +875,12 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"✅ Saved as {key}\nError: {str(e)[:100]}")
             
-    except Exception as e:
-        log.error(f"Upload error: {e}")
-        await update.message.reply_text("❌ Upload failed")
+       except Exception as e:
+        log.exception("Upload error")
+        await update.message.reply_text(
+            f"❌ Upload failed:\n{str(e)[:200]}"
+        )
+
 
 # ============ STATS COMMAND ============
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
