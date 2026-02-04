@@ -310,12 +310,13 @@ class Database:
 
 
     
-    def save_file(self, file_id: str, file_info: dict) -> str:
+  def save_file(self, file_id: str, file_info: dict) -> str:
+    """Save file info and return generated ID"""
     with db_lock:
-        """Save file info and return generated ID"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            
+            # rest of your code here
+
             # Generate ID
             cursor.execute("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files")
             max_id = cursor.fetchone()[0]
