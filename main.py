@@ -915,71 +915,36 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN FUNCTION ============
 
 
-import os
-import time
-import threading
-import asyncio
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes
-)
 
 # ========== DEFINE ENVIRONMENT VARIABLES ==========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-CHANNEL_1 = os.environ.get("CHANNEL_1", "")
-CHANNEL_2 = os.environ.get("CHANNEL_2", "")
+
 
 # ========== PLACEHOLDER HANDLER FUNCTIONS ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello! Bot is running.")
 
-async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cleanup function called.")
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Stats function called.")
-
-async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Upload function called.")
-
-async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(text="Checking join status...")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Error occurred: {context.error}")
-    if update and update.message:
-        await update.message.reply_text(f"An error occurred: {context.error}")
 
 # ---------------- FLASK SERVER ----------------
-def run_flask_thread():
-    from flask import Flask, jsonify
-    from werkzeug.serving import make_server
+# def run_flask_thread():
+#     from flask import Flask, jsonify
+#     from werkzeug.serving import make_server
 
-    app = Flask(__name__)
+#     app = Flask(__name__)
 
-    @app.route("/")
-    def index():
-        return "Bot Web Dashboard ✅"
+#     @app.route("/")
+#     def index():
+#         return "Bot Web Dashboard ✅"
 
-    @app.route("/health")
-    def health():
-        return jsonify({"status": "ok", "service": "telegram-bot"}), 200
+#     @app.route("/health")
+#     def health():
+#         return jsonify({"status": "ok", "service": "telegram-bot"}), 200
 
-    @app.route("/ping")
-    def ping():
-        return "pong", 200
+#     @app.route("/ping")
+#     def ping():
+#         return "pong", 200
 
-    port = int(os.environ.get("PORT", 10000))
-    server = make_server("0.0.0.0", port, app)
-    server.serve_forever()
+#     port = int(os.environ.get("PORT", 10000))
+#     server = make_server("0.0.0.0", port, app)
+#     server.serve_forever()
 
 
 # ---------------- TELEGRAM BOT ----------------
@@ -1000,7 +965,9 @@ def start_bot():
 
     upload_filter = filters.VIDEO | filters.ATTACHMENT
     application.add_handler(
-        MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
+        #MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
+       MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+    upload) 
     )
 
     print("🟢 Bot is running and listening...")
