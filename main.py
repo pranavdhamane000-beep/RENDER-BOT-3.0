@@ -824,8 +824,9 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Format: {ext.upper()}\n"
                     "Users will download this file"
                 )
-            else:
-                is_video = mime_type.startswith("video/")
+           else:
+        is_video = False
+
 
         else:
             await msg.reply_text("❌ Please send a video or document")
@@ -854,11 +855,10 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        log.exception("Upload error")
-        await update.message.reply_text(
-            f"❌ Upload failed:\n{str(e)[:200]}"
-        )200]}"
-        )
+    log.exception("Upload error")
+    await update.message.reply_text(
+        f"❌ Upload failed:\n{str(e)[:200]}"
+    )
 
 
 # ============ MAIN FUNCTION ============
