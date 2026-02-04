@@ -12,13 +12,16 @@ import threading
 import sqlite3
 from contextlib import contextmanager
 
+
+
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
 app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "TelegramBot"
+bot_username = "xiomovies_bot"
+
 
 @app.route('/')
 def home():
@@ -580,120 +583,112 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
 
+# ============ STATS ============
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    uptime_seconds = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+
+    file_count = db.get_file_count()
+    db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
+
+    await update.message.reply_text(
+        "📊 *Bot Statistics*\n\n"
+        f"🤖 Bot: @{bot_username}\n"
+        f"⏱ Uptime: {uptime_str}\n"
+        f"📁 Files: {file_count}\n"
+        f"💾 DB Size: {db_size:.1f} KB\n"
+        f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days\n"
+        f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n\n"
+        f"📢 Channels:\n"
+        f"1. @{CHANNEL_1}\n"
+        f"2. @{CHANNEL_2}",
+        parse_mode="Markdown"
+    )
+
 # ============ START COMMAND ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start"""
     try:
         if not update.message:
             return
-        
+
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         args = context.args
-        
+
+        # ❗ No file key → just show join info
         if not args:
+            keyboard = [
+                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")]
+            ]
+
             await update.message.reply_text(
-                "🤖 File Sharing Bot\n\n"
+                "🤖 *File Sharing Bot*\n\n"
                 "🔗 Use admin-provided links\n"
-                "📢 Join channels to access files\n\n"
-                f"Join:\n"
-                f"1. @{CHANNEL_1}\n"
-                f"2. @{CHANNEL_2}"
+                "📢 Join both channels to access files",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
             )
             return
-        
+
+        # ✅ File key exists
         key = args[0]
-        
-        # Check if file exists
+
         file_info = db.get_file(key)
         if not file_info:
             await update.message.reply_text("❌ File not found or expired")
             return
-        
-        # Check membership (ASYNC)
+
+        # Membership check
         result = await check_membership_async(context.bot, user_id)
-        
-        if not result['all_joined']:
-            # Build missing channels list
-            missing = []
-            if not result['channel1']:
-                missing.append(f"@{CHANNEL_1}")
-            if not result['channel2']:
-                missing.append(f"@{CHANNEL_2}")
-            
-            keyboard = []
-            text = "📢 Join these channels to access files:\n"
-            
-            if not result['channel1']:
-                text += f"\n• @{CHANNEL_1}"
-                keyboard.append([InlineKeyboardButton("Join Channel 1", url=f"https://t.me/{CHANNEL_1.replace('@', '')}")])
-            
-            if not result['channel2']:
-                text += f"\n• @{CHANNEL_2}"
-                keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
-            
-            # Show errors if any
-            if result['errors']:
-                text += f"\n\n⚠️ Note: {', '.join(result['errors'])}"
-            
-            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
-            
+
+        if not result["all_joined"]:
+            keyboard = [
+                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+            ]
+
             await update.message.reply_text(
-                text,
+                "🔒 *Access Locked*\n\n"
+                "Please join both channels to unlock this file 👇",
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
+                parse_mode="Markdown"
             )
             return
-        
-        # Send file
-        filename = file_info.get('file_name', 'file')
+
+        # ✅ Send file
         send_as_video, supports_streaming = should_send_as_video(file_info)
-        
-        try:
-            if send_as_video and file_info.get('is_video'):
-                sent_msg = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=file_info["file_id"],
-                    caption=f"📹 {filename}",
-                    supports_streaming=supports_streaming,
-                    read_timeout=TIMEOUT,
-                    write_timeout=TIMEOUT
-                )
-            else:
-                sent_msg = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=file_info["file_id"],
-                    caption=f"📁 {filename}",
-                    read_timeout=TIMEOUT,
-                    write_timeout=TIMEOUT
-                )
-        except Exception as e:
-            log.error(f"Send failed: {e}")
-            await update.message.reply_text("❌ Failed to send file")
-            return
-        
-        # Schedule deletion
+
+        if send_as_video and file_info["is_video"]:
+            sent = await context.bot.send_video(
+                chat_id=chat_id,
+                video=file_info["file_id"],
+                caption=f"📹 {file_info['file_name']}",
+                supports_streaming=supports_streaming
+            )
+        else:
+            sent = await context.bot.send_document(
+                chat_id=chat_id,
+                document=file_info["file_id"],
+                caption=f"📁 {file_info['file_name']}"
+            )
+
         context.job_queue.run_once(
             delete_job,
             DELETE_AFTER,
-            data={"chat": chat_id, "msg": sent_msg.message_id}
+            data={"chat": chat_id, "msg": sent.message_id}
         )
-        
-        # Send auto-delete warning
-        warn = await update.message.reply_text(
-            f"✅ File sent\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes"
-        )
-        
-        context.job_queue.run_once(
-            delete_job,
-            DELETE_AFTER + 30,
-            data={"chat": chat_id, "msg": warn.message_id}
-        )
-        
+
     except Exception as e:
         log.error(f"Start error: {e}")
-        if update.message:
-            await update.message.reply_text("❌ Error processing request")
+        await update.message.reply_text("❌ Error processing request")
+
+
 
 # ============ CALLBACK ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -783,138 +778,82 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.answer("Error occurred", show_alert=True)
 
 # ============ UPLOAD ============
+# ============ UPLOAD HANDLER (ADMIN ONLY) ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle file uploads (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
-    
+
     try:
-        video = update.message.video
-        document = update.message.document
-        
+        msg = update.message
+        video = msg.video
+        document = msg.document
+
         file_id = None
         filename = None
         mime_type = None
         file_size = 0
         is_video = False
-        
+
+        # 🎥 VIDEO MESSAGE (MP4 etc.)
         if video:
-            # Video message (always playable)
             file_id = video.file_id
-            filename = getattr(video, 'file_name', f'video_{int(time.time())}.mp4')
-            mime_type = getattr(video, 'mime_type', 'video/mp4')
-            file_size = getattr(video, 'file_size', 0)
+            filename = video.file_name or f"video_{int(time.time())}.mp4"
+            mime_type = video.mime_type or "video/mp4"
+            file_size = video.file_size or 0
             is_video = True
-            
-        elif document and is_video_file(document):
+
+        # 📁 DOCUMENT (MKV, AVI, ZIP, etc.)
+        elif document:
             file_id = document.file_id
-            filename = getattr(document, 'file_name', f'file_{int(time.time())}')
-            mime_type = getattr(document, 'mime_type', '')
-            file_size = getattr(document, 'file_size', 0)
-            
-            # Check if playable
-            filename_lower = filename.lower()
-            ext = filename_lower.split('.')[-1] if '.' in filename_lower else ''
-            
-            if ext in {'mkv', 'avi', 'webm', 'flv'}:
+            filename = document.file_name or f"file_{int(time.time())}"
+            mime_type = document.mime_type or ""
+            file_size = document.file_size or 0
+
+            ext = filename.lower().split('.')[-1]
+
+            # ❗ Non-streamable formats
+            if ext in {"mkv", "avi", "webm", "flv"}:
                 is_video = False
-                await update.message.reply_text(
-                    "⚠️ Non-playable video format (sent as document)\n"
+                await msg.reply_text(
+                    "⚠️ Non-playable video format\n"
                     f"Format: {ext.upper()}\n"
-                    "Note: Users will download this file"
+                    "Users will download this file"
                 )
-
             else:
-                # Check if playable format
-                send_as_video, _ = should_send_as_video({
-                    'file_name': filename,
-                    'mime_type': mime_type
-                })
-                is_video = send_as_video
-                
-        else:
-            await update.message.reply_text(
-                "❌ Send a video file\n\n"
-                "🎥 Playable (sent as video):\n"
-                "• MP4, MOV, M4V, MPG, MPEG\n\n"
-                "📁 Download only (sent as document):\n"
-                "• MKV, AVI, WEBM, FLV\n\n"
-                "📦 Max: 2GB (Telegram limit)"
-            )
-            return
-        
-        # Save to database
-        file_info = {
-    'file_name': filename or "unknown_file",
-    'mime_type': mime_type or "",
-    'is_video': bool(is_video),
-    'size': int(file_size or 0)
-}
+                is_video = mime_type.startswith("video/")
 
-        
+        else:
+            await msg.reply_text("❌ Please send a video or document")
+            return
+
+        # 💾 SAVE TO DATABASE
+        file_info = {
+            "file_name": filename,
+            "mime_type": mime_type,
+            "is_video": is_video,
+            "size": int(file_size)
+        }
+
         key = db.save_file(file_id, file_info)
+        # 🔗 GENERATE LINK
         
-        # Generate link
-        try:
-            bot_user = await context.bot.get_me()
-            global bot_username
-            bot_username = bot_user.username
-            link = f"https://t.me/{bot_username}?start={key}"
-            
-            file_type = "🎥 Video" if is_video else "📁 Document"
-            await update.message.reply_text(
-                f"✅ Uploaded\n"
-                f"ID: <code>{key}</code>\n"
-                f"Name: {filename}\n"
-                f"Type: {file_type}\n"
-                f"Size: {file_size/1024/1024:.1f} MB\n\n"
-                f"🔗 Link:\n<code>{link}</code>",
-                parse_mode='HTML'
-            )
-            
-        except Exception as e:
-            await update.message.reply_text(f"✅ Saved as {key}\nError: {str(e)[:100]}")
-            
-       except Exception as e:
+        link = f"https://t.me/{bot_username}?start={key}"
+
+        await msg.reply_text(
+            "✅ *Upload Successful*\n\n"
+            f"📁 Name: `{filename}`\n"
+            f"🎬 Type: {'Video' if is_video else 'Document'}\n"
+            f"📦 Size: {file_size/1024/1024:.1f} MB\n\n"
+            f"🔗 Link:\n{link}",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
         log.exception("Upload error")
         await update.message.reply_text(
             f"❌ Upload failed:\n{str(e)[:200]}"
         )
 
-
-# ============ STATS COMMAND ============
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics (admin only)"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    try:
-        file_count = db.get_file_count()
-        
-        # Get database size
-        db_size = os.path.getsize(DB_PATH) if DB_PATH.exists() else 0
-        
-        # Get uptime
-        uptime_seconds = time.time() - start_time
-        uptime_str = str(timedelta(seconds=int(uptime_seconds)))
-        
-        message = (
-            f"📊 Bot Statistics\n\n"
-            f"🤖 Bot: @{bot_username}\n"
-            f"⏱️ Uptime: {uptime_str}\n"
-            f"📁 Files: {file_count}\n"
-            f"💾 DB Size: {db_size/1024:.1f} KB\n"
-            f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days\n"
-            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n\n"
-            f"📺 Channels:\n"
-            f"1. @{CHANNEL_1}\n"
-            f"2. @{CHANNEL_2}"
-        )
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
 # ============ MAIN FUNCTION ============
 
@@ -967,7 +906,9 @@ def start_bot():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
-    upload_filter = filters.VIDEO | filters.ATTACHMENT
+    upload_filter = filters.VIDEO | filters.Document.ALL
+
+
     application.add_handler(
         #MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
