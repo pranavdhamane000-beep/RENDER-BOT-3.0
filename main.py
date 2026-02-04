@@ -605,7 +605,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
 
     await update.message.reply_text(
-        "📊 *Bot Statistics*\n\n"
+        f"📊 Bot Statistics\n\n"
         f"🤖 Bot: @{bot_username}\n"
         f"⏱ Uptime: {uptime_str}\n"
         f"📁 Files: {file_count}\n"
@@ -614,10 +614,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n\n"
         f"📢 Channels:\n"
         f"1. @{CHANNEL_1}\n"
-        f"2. @{CHANNEL_2}",
-        parse_mode="Markdown"
+        f"2. @{CHANNEL_2}"
     )
-
 # ============ START COMMAND ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -636,11 +634,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
             await update.message.reply_text(
-                "🤖 *File Sharing Bot*\n\n"
+                "🤖 File Sharing Bot\n\n"
                 "🔗 Use admin-provided links\n"
                 "📢 Join both channels to access files",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
 
@@ -663,10 +660,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
 
             await update.message.reply_text(
-                "🔒 *Access Locked*\n\n"
+                "🔒 Access Locked\n\n"
                 "Please join both channels to unlock this file 👇",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
 
@@ -746,7 +742,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'
+                
             )
             return
         
@@ -824,7 +820,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ext in {"mkv", "avi", "webm", "flv"}:
                 is_video = False
                 await msg.reply_text(
-                    " Enjoy \n"
+                    f"Enjoy \n"
                     f"Format: {ext.upper()}\n"
                     "Users will download this file"
                 )
@@ -848,19 +844,20 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         link = f"https://t.me/{bot_username}?start={key}"
 
+        # FIXED: Removed Markdown formatting
         await msg.reply_text(
-            "✅ *Upload Successful*\n\n"
-            f"📁 Name: `{filename}`\n"
+            f"✅ Upload Successful\n\n"
+            f"📁 Name: {filename}\n"
             f"🎬 Type: {'Video' if is_video else 'Document'}\n"
             f"📦 Size: {file_size/1024/1024:.1f} MB\n\n"
-            f"🔗 Link:\n{link}",
-            parse_mode="Markdown"
+            f"🔗 Link:\n{link}"
         )
 
     except Exception as e:
         log.exception("Upload error")
         await update.message.reply_text(
             f"❌ Upload failed:\n{str(e)[:200]}"
+        )200]}"
         )
 
 
