@@ -12,6 +12,7 @@ import threading
 import sqlite3
 from contextlib import contextmanager
 
+db_lock = threading.Lock()
 
 
 # ================= HEALTH SERVER FOR RENDER =================
@@ -296,16 +297,23 @@ class Database:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
             conn.commit()
     
-    @contextmanager
-    def get_connection(self):
-        """Get a database connection with automatic cleanup"""
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            yield conn
-        finally:
-            conn.close()
+   @contextmanager
+def get_connection(self):
+    conn = sqlite3.connect(
+        str(self.db_path),
+        timeout=30,
+        check_same_thread=False
+    )
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        yield conn
+    finally:
+        conn.close()
+
     
     def save_file(self, file_id: str, file_info: dict) -> str:
+    with db_lock:
         """Save file info and return generated ID"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -328,7 +336,7 @@ class Database:
             ))
             
             # Cleanup old files if needed
-            self.cleanup_old_files()
+            
             
             conn.commit()
             return new_id
@@ -815,7 +823,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ext in {"mkv", "avi", "webm", "flv"}:
                 is_video = False
                 await msg.reply_text(
-                    "⚠️ Non-playable video format\n"
+                    " Enjoy \n"
                     f"Format: {ext.upper()}\n"
                     "Users will download this file"
                 )
