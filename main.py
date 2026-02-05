@@ -809,23 +809,20 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 📁 DOCUMENT (MKV, AVI, ZIP, etc.)
         elif document:
-            file_id = document.file_id
-            filename = document.file_name or f"file_{int(time.time())}"
-            mime_type = document.mime_type or ""
-            file_size = document.file_size or 0
+    filename = document.file_name
+    mime_type = document.mime_type or ""
+    ext = filename.lower().split('.')[-1]
 
-            ext = filename.lower().split('.')[-1]
-
-            # ❗ Non-streamable formats
-            if ext in {"mkv", "avi", "webm", "flv"}:
-                is_video = False
-                await msg.reply_text(
-                    f"Enjoy \n"
-                    f"Format: {ext.upper()}\n"
-                    "Users will download this file"
-                )
-           else:
+    if ext in {"mkv", "avi", "webm", "flv"}:
         is_video = False
+        await msg.reply_text(
+            f"Enjoy\n"
+            f"Format: {ext.upper()}\n"
+            "Users will download this file"
+        )
+    else:
+        is_video = False
+
 
 
         else:
