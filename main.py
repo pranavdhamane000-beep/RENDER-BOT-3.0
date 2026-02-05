@@ -14,14 +14,13 @@ from contextlib import contextmanager
 
 db_lock = threading.Lock()
 
-
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
 app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xiomovies_bot"  # This will be updated when bot starts
 
 
 @app.route('/')
@@ -155,14 +154,13 @@ def home():
     # Get file count from database
     file_count = 0
     try:
-        file_count = db.get_file_count()
+        file_count = get_file_count()
     except:
         pass
     
     # Check for channel access issues
     error = None
     try:
-        import os
         if not os.environ.get("BOT_TOKEN"):
             error = "BOT_TOKEN not set in environment"
     except:
@@ -217,7 +215,7 @@ from telegram.ext import (
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) if os.environ.get("ADMIN_ID", "0").isdigit() else 0
 
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web")
@@ -443,24 +441,43 @@ async def is_member_async(bot, channel: str, user_id: int) -> Optional[bool]:
     # Check cache first
     cached = db.get_cached_membership(user_id, channel)
     if cached is not None:
+        log.info(f"Cached result for {user_id} in {channel}: {cached}")
         return cached
     
-    chat_id = f"@{channel}" if not channel.startswith("@") else channel
+    # Clean up channel name
+    channel = channel.strip()
+    if channel.startswith("https://t.me/"):
+        channel = channel.replace("https://t.me/", "")
+    if channel.startswith("@"):
+        channel = channel[1:]
+    
+    chat_id = f"@{channel}"
+    
+    log.info(f"Checking membership for {user_id} in {chat_id}")
     
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         is_member = member.status in ("member", "administrator", "creator")
+        log.info(f"Membership result for {user_id} in {chat_id}: {is_member} (status: {member.status})")
         db.cache_membership(user_id, channel, is_member)
         return is_member
     except Exception as e:
         err = str(e).lower()
-        if "user not found" in err or "chat not found" in err:
+        log.error(f"Membership check error for {chat_id}: {e}")
+        
+        # Handle common error cases
+        if "user not found" in err or "chat not found" in err or "400" in err:
             db.cache_membership(user_id, channel, False)
             return False
-        elif "forbidden" in err:
+        elif "forbidden" in err or "bot was kicked" in err or "bot is not a member" in err:
             # Bot doesn't have permission to check membership
             log.warning(f"Bot cannot check membership in {channel}: {e}")
+            # Don't cache in this case as we don't know the actual status
             return None
+        elif "user is deactivated" in err or "user not participant" in err:
+            # User account is deleted/banned
+            db.cache_membership(user_id, channel, False)
+            return False
         else:
             log.warning(f"Membership check failed for {channel}: {e}")
             return None
@@ -478,18 +495,20 @@ async def check_membership_async(bot, user_id: int) -> Dict[str, Any]:
         # Check first channel
         ch1 = await is_member_async(bot, CHANNEL_1, user_id)
         if ch1 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_1}")
+            result['errors'].append(f"Cannot check @{CHANNEL_1} (bot may not have permission)")
             ch1 = False
         
         # Check second channel
         ch2 = await is_member_async(bot, CHANNEL_2, user_id)
         if ch2 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_2}")
+            result['errors'].append(f"Cannot check @{CHANNEL_2} (bot may not have permission)")
             ch2 = False
         
         result['channel1'] = ch1
         result['channel2'] = ch2
         result['all_joined'] = ch1 and ch2
+        
+        log.info(f"Final membership check for {user_id}: ch1={ch1}, ch2={ch2}, all_joined={result['all_joined']}")
         
     except Exception as e:
         log.error(f"Membership check error: {e}")
@@ -559,7 +578,7 @@ async def delete_job(context):
 # ============ ERROR HANDLER ============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
-    log.error(f"Error: {context.error}", exc_info=False)
+    log.error(f"Error: {context.error}", exc_info=True)
 
 # ============ CLEANUP COMMAND ============
 async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,7 +596,18 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     
     try:
-        # Run cleanup
+        # Run cleanup with specified days
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE timestamp < datetime('now', ?)
+            ''', (f'-{days} days',))
+            
+            deleted = cursor.rowcount
+            conn.commit()
+        
+        # Also run regular cleanup to limit files
         db.cleanup_old_files()
         
         # Get new count
@@ -585,7 +615,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         msg = f"🧹 Cleanup complete\n"
         msg += f"Files retained: {file_count}\n"
-        msg += f"Old files (> {days} days) removed"
+        msg += f"Old files (> {days} days) removed: {deleted}"
         
         await update.message.reply_text(msg)
         
@@ -653,23 +683,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership_async(context.bot, user_id)
 
         if not result["all_joined"]:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-            ]
+            # Build detailed message showing which channels are missing
+            text = "🔒 Access Locked\n\n"
+            if not result['channel1']:
+                text += f"❌ Not joined: @{CHANNEL_1}\n"
+            if not result['channel2']:
+                text += f"❌ Not joined: @{CHANNEL_2}\n"
+            text += "\nPlease join both channels to unlock this file 👇"
+            
+            keyboard = []
+            if not result['channel1']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+            if not result['channel2']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+            
+            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
+            
+            # Add timestamp to prevent "not modified" errors
+            text += f"\n\n🕐 Checked at: {datetime.now().strftime('%H:%M:%S')}"
 
             await update.message.reply_text(
-                "🔒 Access Locked\n\n"
-                "Please join both channels to unlock this file 👇",
+                text,
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
 
-        # ✅ Send file
+        # ✅ Send file - user has joined both channels
         send_as_video, supports_streaming = should_send_as_video(file_info)
 
-        if send_as_video and file_info["is_video"]:
+        if send_as_video and file_info.get("is_video"):
             sent = await context.bot.send_video(
                 chat_id=chat_id,
                 video=file_info["file_id"],
@@ -683,17 +725,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"📁 {file_info['file_name']}"
             )
 
-        context.job_queue.run_once(
-            delete_job,
-            DELETE_AFTER,
-            data={"chat": chat_id, "msg": sent.message_id}
-        )
+        # Schedule deletion
+        if sent:
+            context.job_queue.run_once(
+                delete_job,
+                DELETE_AFTER,
+                data={"chat": chat_id, "msg": sent.message_id}
+            )
 
     except Exception as e:
-        log.error(f"Start error: {e}")
-        await update.message.reply_text("❌ Error processing request")
-
-
+        log.error(f"Start error: {e}", exc_info=True)
+        if update.message:
+            await update.message.reply_text("❌ Error processing request")
 
 # ============ CALLBACK ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -702,7 +745,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not query:
             return
-        await query.answer()
+        
+        await query.answer("Checking membership...")
         
         user_id = query.from_user.id
         data_parts = query.data.split("|")
@@ -710,7 +754,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(data_parts) != 2:
             return
         
-        _, key = data_parts
+        action, key = data_parts
         
         # Check if file exists
         file_info = db.get_file(key)
@@ -722,35 +766,57 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership_async(context.bot, user_id)
         
         if not result['all_joined']:
-            # Update the message with current status
-            text = "❌ Still not joined:\n"
+            # Build detailed message
+            text = "❌ Still not joined:\n\n"
+            
             if not result['channel1']:
-                text += f"\n• @{CHANNEL_1}"
+                text += f"• ❌ @{CHANNEL_1}\n"
+            else:
+                text += f"• ✅ @{CHANNEL_1}\n"
+                
             if not result['channel2']:
-                text += f"\n• @{CHANNEL_2}"
+                text += f"• ❌ @{CHANNEL_2}\n"
+            else:
+                text += f"• ✅ @{CHANNEL_2}\n"
             
+            # Show errors if any
             if result['errors']:
-                text += f"\n\n⚠️ {', '.join(result['errors'])}"
+                text += f"\n⚠️ Note: {', '.join(result['errors'])}"
             
+            text += f"\n\n🔄 Click 'Check Again' after joining"
+            text += f"\n🕐 Last checked: {datetime.now().strftime('%H:%M:%S')}"
+            
+            # Build keyboard
             keyboard = []
             if not result['channel1']:
-                keyboard.append([InlineKeyboardButton("Join Channel 1", url=f"https://t.me/{CHANNEL_1.replace('@', '')}")])
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
             if not result['channel2']:
-                keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
             keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
             
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                
-            )
+            try:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    raise
             return
         
-        # Send file
+        # ✅ User has joined both channels
         filename = file_info.get('file_name', 'file')
-        send_as_video, supports_streaming = should_send_as_video(file_info)
         
+        # Edit the message to show success
         try:
+            await query.edit_message_text(f"✅ Access granted! Sending file: {filename}...")
+        except:
+            pass
+        
+        # Send the file
+        try:
+            send_as_video, supports_streaming = should_send_as_video(file_info)
+            
             if send_as_video and file_info.get('is_video'):
                 sent_msg = await context.bot.send_video(
                     chat_id=query.message.chat_id,
@@ -764,25 +830,29 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=file_info["file_id"],
                     caption=f"📁 {filename}"
                 )
+            
+            # Schedule deletion
+            if sent_msg:
+                context.job_queue.run_once(
+                    delete_job,
+                    DELETE_AFTER,
+                    data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                )
+                
         except Exception as e:
-            await query.edit_message_text("❌ Failed to send file")
-            return
-        
-        await query.edit_message_text("✅ Access granted! File sent.")
-        
-        # Schedule deletion
-        context.job_queue.run_once(
-            delete_job,
-            DELETE_AFTER,
-            data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
-        )
+            log.error(f"Failed to send file: {e}")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="❌ Failed to send file. Please try again."
+            )
         
     except Exception as e:
-        log.error(f"Callback error: {e}")
-        if update.callback_query:
-            await update.callback_query.answer("Error occurred", show_alert=True)
+        log.error(f"Callback error: {e}", exc_info=True)
+        try:
+            await query.answer("Error occurred. Please try again.", show_alert=True)
+        except:
+            pass
 
-# ============ UPLOAD ============
 # ============ UPLOAD HANDLER (ADMIN ONLY) ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -809,21 +879,26 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 📁 DOCUMENT (MKV, AVI, ZIP, etc.)
         elif document:
-    filename = document.file_name
-    mime_type = document.mime_type or ""
-    ext = filename.lower().split('.')[-1]
-
-    if ext in {"mkv", "avi", "webm", "flv"}:
-        is_video = False
-        await msg.reply_text(
-            f"Enjoy\n"
-            f"Format: {ext.upper()}\n"
-            "Users will download this file"
-        )
-    else:
-        is_video = False
-
-
+            filename = document.file_name or f"document_{int(time.time())}"
+            file_id = document.file_id
+            mime_type = document.mime_type or ""
+            file_size = document.file_size or 0
+            ext = filename.lower().split('.')[-1] if '.' in filename else ""
+            
+            # Check if it's a video document
+            if ext in ALL_VIDEO_EXTS:
+                if ext in {"mkv", "avi", "webm", "flv"}:
+                    is_video = False
+                    await msg.reply_text(
+                        f"📁 Document saved\n"
+                        f"Format: {ext.upper()}\n"
+                        "Users will download this file as a document"
+                    )
+                else:
+                    # MP4, MOV, etc. sent as documents
+                    is_video = True
+            else:
+                is_video = False
 
         else:
             await msg.reply_text("❌ Please send a video or document")
@@ -839,68 +914,59 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         key = db.save_file(file_id, file_info)
         # 🔗 GENERATE LINK
-        
         link = f"https://t.me/{bot_username}?start={key}"
 
-        # FIXED: Removed Markdown formatting
         await msg.reply_text(
             f"✅ Upload Successful\n\n"
             f"📁 Name: {filename}\n"
             f"🎬 Type: {'Video' if is_video else 'Document'}\n"
-            f"📦 Size: {file_size/1024/1024:.1f} MB\n\n"
+            f"📦 Size: {file_size/1024/1024:.1f} MB\n"
+            f"🔑 Key: {key}\n\n"
             f"🔗 Link:\n{link}"
         )
 
     except Exception as e:
-    log.exception("Upload error")
-    await update.message.reply_text(
-        f"❌ Upload failed:\n{str(e)[:200]}"
-    )
+        log.exception("Upload error")
+        await update.message.reply_text(
+            f"❌ Upload failed:\n{str(e)[:200]}"
+        )
 
 
-# ============ MAIN FUNCTION ============
+# ============ GET BOT USERNAME ============
+async def get_bot_username(application):
+    """Get bot username dynamically"""
+    try:
+        bot = await application.bot.get_me()
+        return bot.username
+    except Exception as e:
+        log.error(f"Failed to get bot username: {e}")
+        return "xiomovies_bot"  # fallback
 
-
-
-# ========== DEFINE ENVIRONMENT VARIABLES ==========
-
-
-# ========== PLACEHOLDER HANDLER FUNCTIONS ==========
-
-
-
-# ---------------- FLASK SERVER ----------------
-# def run_flask_thread():
-#     from flask import Flask, jsonify
-#     from werkzeug.serving import make_server
-
-#     app = Flask(__name__)
-
-#     @app.route("/")
-#     def index():
-#         return "Bot Web Dashboard ✅"
-
-#     @app.route("/health")
-#     def health():
-#         return jsonify({"status": "ok", "service": "telegram-bot"}), 200
-
-#     @app.route("/ping")
-#     def ping():
-#         return "pong", 200
-
-#     port = int(os.environ.get("PORT", 10000))
-#     server = make_server("0.0.0.0", port, app)
-#     server.serve_forever()
-
-
-# ---------------- TELEGRAM BOT ----------------
-def start_bot():
+# ============ MAIN BOT FUNCTION ============
+async def start_bot_async():
+    """Async version of start_bot"""
     # ✅ CRITICAL FIX: Check for BOT_TOKEN here too
-    if not BOT_TOKEN:
-        print("❌ ERROR: BOT_TOKEN is not set!")
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ ERROR: BOT_TOKEN is not set or is still default!")
+        print("💡 Set it as environment variable: BOT_TOKEN=your_bot_token_here")
+        return
+    
+    if not ADMIN_ID or ADMIN_ID == 0:
+        print("❌ ERROR: ADMIN_ID is not set or invalid!")
+        print("💡 Get your Telegram ID from @userinfobot")
         return
     
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Get bot username dynamically
+    global bot_username
+    try:
+        bot_info = await application.bot.get_me()
+        bot_username = bot_info.username
+        print(f"🟢 Bot username detected: @{bot_username}")
+    except Exception as e:
+        print(f"⚠️ Could not get bot username: {e}")
+        print(f"🟢 Using default: @{bot_username}")
 
     # Handlers (must be async functions!)
     application.add_error_handler(error_handler)
@@ -909,36 +975,51 @@ def start_bot():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
+    # Upload handler - admin only in private chats
     upload_filter = filters.VIDEO | filters.Document.ALL
-
-
     application.add_handler(
-        #MessageHandler(upload_filter & filters.User(ADMIN_ID), upload)
-       MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
-    upload) 
+        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
 
     print("🟢 Bot is running and listening...")
+    print(f"🟢 Bot username: @{bot_username}")
+    print(f"🟢 Admin ID: {ADMIN_ID}")
+    print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
     print("🟢 Press Ctrl+C to stop")
-    application.run_polling(
+    
+    # Run auto cleanup on startup
+    try:
+        db.cleanup_old_files()
+        print(f"🟢 Database cleanup complete. Files: {db.get_file_count()}")
+    except Exception as e:
+        print(f"⚠️ Database cleanup failed: {e}")
+    
+    await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
 
+def start_bot():
+    """Wrapper to run async bot"""
+    asyncio.run(start_bot_async())
 
-# ---------------- MAIN ----------------
+# ============ MAIN ============
 def main():
     print("\n" + "=" * 50)
     print("🤖 TELEGRAM FILE BOT")
     print("=" * 50)
 
     # ✅ ADD THESE CHECKS
-    if not BOT_TOKEN:
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ ERROR: BOT_TOKEN is not set!")
+        print("💡 Set it as environment variable or in .env file")
+        print("💡 Example: BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz")
         return
 
     if not ADMIN_ID or ADMIN_ID == 0:
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
+        print("💡 Get your Telegram ID from @userinfobot")
+        print("💡 Example: ADMIN_ID=123456789")
         return
 
     print(f"🟢 Admin ID: {ADMIN_ID}")
@@ -948,11 +1029,17 @@ def main():
     print("🟢 Starting Flask web dashboard...")
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
-    time.sleep(1)  # Let Flask initialize
+    time.sleep(2)  # Let Flask initialize
     print(f"🟢 Flask running on port {os.environ.get('PORT', 10000)}")
 
     # Start Telegram bot in main thread
-    start_bot()
+    try:
+        start_bot()
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot crashed: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
