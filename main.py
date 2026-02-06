@@ -20,9 +20,377 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"  # This will be updated when bot starts
+bot_username = "xiomovies_bot"
 
+# ===========================================================
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    JobQueue
+)
 
+# ================= CONFIG =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+# Channel usernames (without @)
+CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
+CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
+
+# SQLite database for persistent storage
+DB_PATH = Path("file_bot.db")
+DELETE_AFTER = 20  # 10 minutes - media disappears after this
+MAX_STORED_FILES = 1000
+AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
+
+# Playable formats
+PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
+
+# All video extensions
+ALL_VIDEO_EXTS = {
+    "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", 
+    "3gp", "wmv", "mpg", "mpeg"
+}
+
+# =========================================
+
+# Simple logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+log = logging.getLogger(__name__)
+
+# ================= DATABASE =================
+
+class Database:
+    def __init__(self, db_path: Path = DB_PATH):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize database with required tables"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    id TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT,
+                    is_video INTEGER DEFAULT 0,
+                    file_size INTEGER DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 0
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS membership_cache (
+                    user_id INTEGER,
+                    channel TEXT,
+                    is_member INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, channel)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
+            conn.commit()
+
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30,
+            check_same_thread=False
+        )
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
+        finally:
+            conn.close()
+
+    def save_file(self, file_id: str, file_info: dict) -> str:
+        """Save file info and return generated ID"""
+        with db_lock:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files"
+                )
+                max_id = cursor.fetchone()[0]
+                new_id = str(max_id + 1)
+
+                cursor.execute(
+                    '''
+                    INSERT INTO files
+                    (id, file_id, file_name, mime_type, is_video, file_size, access_count)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    ''',
+                    (
+                        new_id,
+                        file_id,
+                        file_info.get('file_name', ''),
+                        file_info.get('mime_type', ''),
+                        1 if file_info.get('is_video', False) else 0,
+                        file_info.get('size', 0)
+                    )
+                )
+
+                conn.commit()
+                return new_id
+
+    def get_file(self, file_id: str) -> Optional[dict]:
+        """Get file info by ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_id, file_name, mime_type, is_video, file_size, timestamp, access_count
+                FROM files WHERE id = ?
+            ''', (file_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                # Increment access count
+                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = ?', (file_id,))
+                conn.commit()
+                
+                return {
+                    'file_id': row[0],
+                    'file_name': row[1],
+                    'mime_type': row[2],
+                    'is_video': bool(row[3]),
+                    'size': row[4],
+                    'timestamp': row[5],
+                    'access_count': row[6] + 1
+                }
+            return None
+    
+    def cleanup_old_files(self):
+        if AUTO_CLEANUP_DAYS <= 0:
+            log.info("Auto-cleanup DISABLED (AUTO_CLEANUP_DAYS = 0). Files will be kept forever.")
+            return
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE timestamp < datetime('now', ?)
+            ''', (f'-{AUTO_CLEANUP_DAYS} days',))
+            
+            deleted = cursor.rowcount
+            if deleted > 0:
+                log.info(f"Auto-cleanup removed {deleted} old files from database")
+            
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE id NOT IN (
+                    SELECT id FROM files 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (MAX_STORED_FILES,))
+            
+            if cursor.rowcount > 0:
+                log.info(f"Limited files to {MAX_STORED_FILES} in database")
+            
+            conn.commit()
+    
+    def get_file_count(self) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM files")
+            return cursor.fetchone()[0]
+    
+    def cache_membership(self, user_id: int, channel: str, is_member: bool):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO membership_cache (user_id, channel, is_member, timestamp)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, channel, 1 if is_member else 0))
+            conn.commit()
+    
+    def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT is_member FROM membership_cache 
+                WHERE user_id = ? AND channel = ? 
+                AND timestamp > datetime('now', '-5 minutes')
+            ''', (user_id, channel))
+            row = cursor.fetchone()
+            return bool(row[0]) if row else None
+
+    def clear_membership_cache(self, user_id: Optional[int] = None):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if user_id:
+                cursor.execute("DELETE FROM membership_cache WHERE user_id = ?", (user_id,))
+                log.info(f"Cleared cache for user {user_id}")
+            else:
+                cursor.execute("DELETE FROM membership_cache")
+                log.info("Cleared all membership cache")
+            conn.commit()
+
+    def delete_file(self, file_id: str) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
+
+    def get_all_files(self) -> list:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, file_name, is_video, file_size, timestamp, access_count 
+                FROM files ORDER BY timestamp DESC
+            ''')
+            return cursor.fetchall()
+
+# Initialize database
+db = Database()
+
+# ============ HELPER FUNCTION TO SCHEDULE MESSAGE DELETION ============
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    if not context.job_queue:
+        log.warning(f"Job queue not available - cannot schedule deletion for message {message_id}")
+        return
+    
+    try:
+        context.job_queue.run_once(
+            delete_message_job,
+            DELETE_AFTER,
+            data=message_id,
+            chat_id=chat_id,
+            name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
+        )
+        log.info(f"Scheduled deletion of message {message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
+    except Exception as e:
+        log.error(f"Failed to schedule deletion for message {message_id}: {e}")
+
+async def delete_message_job(context):
+    try:
+        job = context.job
+        chat_id = job.chat_id
+        message_id = job.data
+        
+        if not chat_id or not message_id:
+            log.warning(f"Invalid delete job data: chat_id={chat_id}, message_id={message_id}")
+            return
+        
+        log.info(f"Attempting to delete message {message_id} from chat {chat_id}")
+        
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            log.info(f"✅ Successfully deleted message {message_id} from chat {chat_id}")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "message to delete not found" in error_msg:
+                log.info(f"Message {message_id} already deleted from chat {chat_id}")
+            elif "message can't be deleted" in error_msg:
+                log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
+            elif "chat not found" in error_msg:
+                log.info(f"Chat {chat_id} not found - message probably already deleted")
+            else:
+                log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
+                
+    except Exception as e:
+        log.error(f"Error in delete_message_job: {e}", exc_info=True)
+
+# ============ FIXED MEMBERSHIP CHECK ============
+async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
+    if not force_check:
+        cached = db.get_cached_membership(user_id, channel)
+        if cached is not None:
+            log.info(f"Cache hit for user {user_id} in @{channel}: {cached}")
+            return cached
+    
+    try:
+        channel_username = f"@{channel}" if not channel.startswith("@") else channel
+        
+        log.info(f"Checking user {user_id} in {channel_username}")
+        
+        member = await bot.get_chat_member(
+            chat_id=channel_username,
+            user_id=user_id
+        )
+        
+        is_member = member.status in ["member", "administrator", "creator"]
+        
+        log.info(f"User {user_id} in {channel_username}: status={member.status}, is_member={is_member}")
+        
+        db.cache_membership(user_id, channel.replace("@", ""), is_member)
+        
+        return is_member
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        log.warning(f"Failed to check user {user_id} in @{channel}: {e}")
+        
+        if "user not found" in error_msg or "user not participant" in error_msg:
+            db.cache_membership(user_id, channel.replace("@", ""), False)
+            return False
+        elif "chat not found" in error_msg:
+            log.error(f"Channel @{channel} not found!")
+            return True
+        elif "forbidden" in error_msg:
+            log.error(f"Bot can't access @{channel}. Might be private or bot not admin.")
+            return True
+        else:
+            return True
+
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
+    bot = context.bot
+    
+    result = {
+        "channel1": False,
+        "channel2": False,
+        "all_joined": False,
+        "missing_channels": []
+    }
+    
+    if force_check:
+        db.clear_membership_cache(user_id)
+    
+    try:
+        ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
+        result["channel1"] = ch1_result
+        if not ch1_result:
+            result["missing_channels"].append(f"@{CHANNEL_1}")
+    except Exception as e:
+        log.error(f"Error checking channel 1: {e}")
+        result["channel1"] = True
+    
+    try:
+        ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
+        result["channel2"] = ch2_result
+        if not ch2_result:
+            result["missing_channels"].append(f"@{CHANNEL_2}")
+    except Exception as e:
+        log.error(f"Error checking channel 2: {e}")
+        result["channel2"] = True
+    
+    result["all_joined"] = result["channel1"] and result["channel2"]
+    
+    log.info(f"Membership check for {user_id}: ch1={result['channel1']}, ch2={result['channel2']}, all={result['all_joined']}")
+    return result
+
+# ============ WEB ROUTES ============
 @app.route('/')
 def home():
     html_content = """
@@ -108,6 +476,7 @@ def home():
             <p>Bot is running on Render</p>
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
+            <p>📁 Storage: PERMANENT (no auto-delete)</p>
         </div>
         
         <div class="info">
@@ -115,16 +484,19 @@ def home():
             <ul>
                 <li>Service: <strong>Render Web Service</strong></li>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Storage: <strong>SQLite Database</strong></li>
+                <li>Channels: <strong>@{{ channel1 }}, @{{ channel2 }}</strong></li>
+                <li>File Storage: <strong>PERMANENT</strong></li>
+                <li>Media Auto-disappear: <strong>{{ delete_minutes }} minutes</strong></li>
             </ul>
         </div>
         
         <div class="warning">
             <h3>⚠️ Important Notes</h3>
             <ul>
-                <li><strong>🎥 Playable:</strong> MP4, MOV, M4V (sent as videos)</li>
-                <li><strong>📁 Download only:</strong> MKV, AVI, WEBM (sent as documents)</li>
-                <li><strong>💾 Storage:</strong> Database persists between deployments</li>
+                <li>Files are stored <strong>PERMANENTLY</strong> in database</li>
+                <li>Media disappears after {{ delete_minutes }} minutes (message stays)</li>
+                <li>Users can access same file multiple times forever</li>
+                <li>Admin must manually delete files if needed</li>
             </ul>
         </div>
         
@@ -133,15 +505,8 @@ def home():
             <p><a href="https://t.me/{{ bot_username }}" target="_blank" class="btn">Start @{{ bot_username }}</a></p>
         </div>
         
-        {% if error %}
-        <div class="error">
-            <h3>⚠️ System Notice</h3>
-            <p>{{ error }}</p>
-        </div>
-        {% endif %}
-        
         <footer style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 10px; font-size: 0.8rem;">
-            <small>Render • {{ current_time }} • v1.0</small>
+            <small>Render • {{ current_time }} • v1.0 • Permanent Storage</small>
         </footer>
     </div>
 </body>
@@ -151,18 +516,9 @@ def home():
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
     
-    # Get file count from database
     file_count = 0
     try:
-        file_count = get_file_count()
-    except:
-        pass
-    
-    # Check for channel access issues
-    error = None
-    try:
-        if not os.environ.get("BOT_TOKEN"):
-            error = "BOT_TOKEN not set in environment"
+        file_count = db.get_file_count()
     except:
         pass
     
@@ -171,7 +527,9 @@ def home():
                                   uptime=uptime_str,
                                   current_time=datetime.now().strftime("%H:%M:%S"),
                                   file_count=file_count,
-                                  error=error)
+                                  channel1=CHANNEL_1,
+                                  channel2=CHANNEL_2,
+                                  delete_minutes=DELETE_AFTER//60)
 
 @app.route('/health')
 def health():
@@ -180,7 +538,9 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "service": "telegram-file-bot",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
-        "database": "sqlite"
+        "database": "sqlite",
+        "storage": "permanent",
+        "file_count": db.get_file_count()
     }), 200
 
 @app.route('/ping')
@@ -188,10 +548,8 @@ def ping():
     return "pong", 200
 
 def run_flask_thread():
-    """Run Flask server in a thread for Render"""
     port = int(os.environ.get('PORT', 10000))
     
-    # Disable verbose logging
     import warnings
     warnings.filterwarnings("ignore")
     
@@ -199,404 +557,29 @@ def run_flask_thread():
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
     flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
     
-    # Use threaded=True for Render compatibility
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
-# ===========================================================
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes
-)
-
-# ================= CONFIG =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0")) if os.environ.get("ADMIN_ID", "0").isdigit() else 0
-
-CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t")
-CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web")
-
-# SQLite database for persistent storage
-DB_PATH = Path("file_bot.db")
-DELETE_AFTER = 600  # 10 minutes
-TIMEOUT = 30
-MAX_STORED_FILES = 100
-AUTO_CLEANUP_DAYS = 7
-
-# Playable formats
-PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
-PLAYABLE_MIME = {"video/mp4", "video/quicktime", "video/mpeg"}
-
-# All video extensions
-ALL_VIDEO_EXTS = {
-    "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", 
-    "3gp", "wmv", "mpg", "mpeg"
-}
-
-# MIME types for video detection
-VIDEO_MIME_TYPES = {
-    "video/mp4", "video/x-matroska", "video/quicktime",
-    "video/x-msvideo", "video/webm", "video/x-flv", "video/3gpp",
-    "video/x-ms-wmv", "video/mpeg"
-}
-# =========================================
-
-# Simple logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-
-log = logging.getLogger(__name__)
-
-# ================= DATABASE =================
-
-class Database:
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.init_db()
-    
-    def init_db(self):
-        """Initialize database with required tables"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS files (
-                    id TEXT PRIMARY KEY,
-                    file_id TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    mime_type TEXT,
-                    is_video INTEGER DEFAULT 0,
-                    file_size INTEGER DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    access_count INTEGER DEFAULT 0
-                )
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS membership_cache (
-                    user_id INTEGER,
-                    channel TEXT,
-                    is_member INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, channel)
-                )
-            ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
-            conn.commit()
-
-    @contextmanager
-    def get_connection(self):
-        conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30,
-            check_same_thread=False
-        )
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            yield conn
-        finally:
-            conn.close()
-
-    def save_file(self, file_id: str, file_info: dict) -> str:
-        """Save file info and return generated ID"""
-        with db_lock:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-
-                cursor.execute(
-                    "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files"
-                )
-                max_id = cursor.fetchone()[0]
-                new_id = str(max_id + 1)
-
-                cursor.execute(
-                    '''
-                    INSERT INTO files
-                    (id, file_id, file_name, mime_type, is_video, file_size)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ''',
-                    (
-                        new_id,
-                        file_id,
-                        file_info.get('file_name', ''),
-                        file_info.get('mime_type', ''),
-                        1 if file_info.get('is_video', False) else 0,
-                        file_info.get('size', 0)
-                    )
-                )
-
-                conn.commit()
-                return new_id
-
-                    
-    
-    def get_file(self, file_id: str) -> Optional[dict]:
-        """Get file info by ID"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT file_id, file_name, mime_type, is_video, file_size, timestamp
-                FROM files WHERE id = ?
-            ''', (file_id,))
-            row = cursor.fetchone()
-            
-            if row:
-                return {
-                    'file_id': row[0],
-                    'file_name': row[1],
-                    'mime_type': row[2],
-                    'is_video': bool(row[3]),
-                    'size': row[4],
-                    'timestamp': row[5]
-                }
-            return None
-    
-    def file_exists(self, file_id: str) -> bool:
-        """Check if file exists"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM files WHERE id = ?", (file_id,))
-            return cursor.fetchone() is not None
-    
-    def cleanup_old_files(self):
-        """Remove files older than AUTO_CLEANUP_DAYS"""
-        if AUTO_CLEANUP_DAYS <= 0:
-            return
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                DELETE FROM files 
-                WHERE timestamp < datetime('now', ?)
-            ''', (f'-{AUTO_CLEANUP_DAYS} days',))
-            
-            deleted = cursor.rowcount
-            if deleted > 0:
-                log.info(f"Auto-cleanup removed {deleted} old files")
-            
-            # Also limit total files
-            cursor.execute('''
-                DELETE FROM files 
-                WHERE id NOT IN (
-                    SELECT id FROM files 
-                    ORDER BY timestamp DESC 
-                    LIMIT ?
-                )
-            ''', (MAX_STORED_FILES,))
-            
-            if cursor.rowcount > 0:
-                log.info(f"Limited files to {MAX_STORED_FILES}")
-            
-            conn.commit()
-    
-    def get_file_count(self) -> int:
-        """Get total number of files"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM files")
-            return cursor.fetchone()[0]
-    
-    def cache_membership(self, user_id: int, channel: str, is_member: bool):
-        """Cache membership check result"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO membership_cache (user_id, channel, is_member, timestamp)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (user_id, channel, 1 if is_member else 0))
-            conn.commit()
-    
-    def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
-        """Get cached membership result (valid for 5 minutes)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT is_member FROM membership_cache 
-                WHERE user_id = ? AND channel = ? 
-                AND timestamp > datetime('now', '-5 minutes')
-            ''', (user_id, channel))
-            row = cursor.fetchone()
-            return bool(row[0]) if row else None
-
-# Initialize database
-db = Database()
-
-def get_file_count():
-    """For web dashboard compatibility"""
-    return db.get_file_count()
-
-# ============ MEMBERSHIP CHECK ============
-async def is_member_async(bot, channel: str, user_id: int) -> Optional[bool]:
-    """ASYNCHRONOUS membership check with caching"""
-    # Check cache first
-    cached = db.get_cached_membership(user_id, channel)
-    if cached is not None:
-        log.info(f"Cached result for {user_id} in {channel}: {cached}")
-        return cached
-    
-    # Clean up channel name
-    channel = channel.strip()
-    if channel.startswith("https://t.me/"):
-        channel = channel.replace("https://t.me/", "")
-    if channel.startswith("@"):
-        channel = channel[1:]
-    
-    chat_id = f"@{channel}"
-    
-    log.info(f"Checking membership for {user_id} in {chat_id}")
-    
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        is_member = member.status in ("member", "administrator", "creator")
-        log.info(f"Membership result for {user_id} in {chat_id}: {is_member} (status: {member.status})")
-        db.cache_membership(user_id, channel, is_member)
-        return is_member
-    except Exception as e:
-        err = str(e).lower()
-        log.error(f"Membership check error for {chat_id}: {e}")
-        
-        # Handle common error cases
-        if "user not found" in err or "chat not found" in err or "400" in err:
-            db.cache_membership(user_id, channel, False)
-            return False
-        elif "forbidden" in err or "bot was kicked" in err or "bot is not a member" in err:
-            # Bot doesn't have permission to check membership
-            log.warning(f"Bot cannot check membership in {channel}: {e}")
-            # Don't cache in this case as we don't know the actual status
-            return None
-        elif "user is deactivated" in err or "user not participant" in err:
-            # User account is deleted/banned
-            db.cache_membership(user_id, channel, False)
-            return False
-        else:
-            log.warning(f"Membership check failed for {channel}: {e}")
-            return None
-
-async def check_membership_async(bot, user_id: int) -> Dict[str, Any]:
-    """ASYNCHRONOUS membership check for both channels"""
-    result = {
-        'channel1': False,
-        'channel2': False,
-        'all_joined': False,
-        'errors': []
-    }
-    
-    try:
-        # Check first channel
-        ch1 = await is_member_async(bot, CHANNEL_1, user_id)
-        if ch1 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_1} (bot may not have permission)")
-            ch1 = False
-        
-        # Check second channel
-        ch2 = await is_member_async(bot, CHANNEL_2, user_id)
-        if ch2 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_2} (bot may not have permission)")
-            ch2 = False
-        
-        result['channel1'] = ch1
-        result['channel2'] = ch2
-        result['all_joined'] = ch1 and ch2
-        
-        log.info(f"Final membership check for {user_id}: ch1={ch1}, ch2={ch2}, all_joined={result['all_joined']}")
-        
-    except Exception as e:
-        log.error(f"Membership check error: {e}")
-        result['errors'].append(str(e))
-    
-    return result
-
-# ============ VIDEO DETECTION ============
-def is_video_file(document) -> bool:
-    """Check if document is a video file"""
-    if not document:
-        return False
-    
-    # Check mime type
-    mime = getattr(document, 'mime_type', '').lower()
-    if mime:
-        for video_mime in VIDEO_MIME_TYPES:
-            if video_mime in mime:
-                return True
-    
-    # Check file extension
-    filename = getattr(document, 'file_name', '').lower()
-    if filename:
-        ext = filename.split('.')[-1] if '.' in filename else ''
-        if ext in ALL_VIDEO_EXTS:
-            return True
-    
-    return False
-
-def should_send_as_video(file_info: Dict[str, Any]) -> Tuple[bool, bool]:
-    """
-    Determine if file should be sent as playable video
-    Returns: (send_as_video, supports_streaming)
-    """
-    filename = file_info.get('file_name', '').lower()
-    mime_type = file_info.get('mime_type', '').lower()
-    
-    # Check by mime type
-    if mime_type:
-        if 'video/mp4' in mime_type:
-            return True, True
-        elif 'video/quicktime' in mime_type or 'video/mpeg' in mime_type:
-            return True, True
-    
-    # Check by extension
-    ext = filename.split('.')[-1] if '.' in filename else ''
-    if ext in PLAYABLE_EXTS:
-        return True, True
-    
-    return False, False
-
-# ============ DELETE JOB ============
-async def delete_job(context):
-    """Delete message"""
-    job = context.job
-    chat_id = job.data.get("chat")
-    message_id = job.data.get("msg")
-    
-    if not chat_id or not message_id:
-        return
-    
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
-
-# ============ ERROR HANDLER ============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
 
-# ============ CLEANUP COMMAND ============
 async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cleanup command - only command besides start/upload"""
     if update.effective_user.id != ADMIN_ID:
         return
     
-    days = 7
+    days = 30
     if context.args:
         try:
             days = int(context.args[0])
-            days = max(1, min(days, 30))
+            days = max(1, min(days, 365))
         except ValueError:
-            await update.message.reply_text("Usage: /cleanup [days=7]")
+            await update.message.reply_text("Usage: /cleanup [days=30]\nSet days=0 to cancel")
             return
     
+    if days == 0:
+        await update.message.reply_text("✅ Cleanup cancelled. Files will be kept permanently.")
+        return
+    
     try:
-        # Run cleanup with specified days
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -607,22 +590,113 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             deleted = cursor.rowcount
             conn.commit()
         
-        # Also run regular cleanup to limit files
-        db.cleanup_old_files()
-        
-        # Get new count
         file_count = db.get_file_count()
         
-        msg = f"🧹 Cleanup complete\n"
-        msg += f"Files retained: {file_count}\n"
-        msg += f"Old files (> {days} days) removed: {deleted}"
+        msg = f"🧹 Manual database cleanup complete\n"
+        msg += f"📁 Files retained in database: {file_count}\n"
+        msg += f"🗑️ Files older than {days} days removed: {deleted}\n\n"
+        msg += f"⚠️ Note: Auto-cleanup is DISABLED. Files are kept permanently by default."
         
-        await update.message.reply_text(msg)
+        sent_msg = await update.message.reply_text(msg)
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         
     except Exception as e:
         await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
 
-# ============ STATS ============
+async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if not context.args:
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /deletefile <file_key>\n\n"
+            "Example: /deletefile 123\n\n"
+            "Use /listfiles to see all files"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    key = context.args[0]
+    
+    file_info = db.get_file(key)
+    if not file_info:
+        sent_msg = await update.message.reply_text(f"❌ File with key '{key}' not found in database")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    filename = file_info.get('file_name', 'Unknown')
+    
+    if db.delete_file(key):
+        sent_msg = await update.message.reply_text(
+            f"✅ File deleted from database\n\n"
+            f"🔑 Key: {key}\n"
+            f"📁 Name: {filename}\n\n"
+            f"⚠️ This file can no longer be accessed by users"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+    else:
+        sent_msg = await update.message.reply_text(f"❌ Failed to delete file '{key}'")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    try:
+        files = db.get_all_files()
+        
+        if not files:
+            sent_msg = await update.message.reply_text("📁 Database is empty. No files stored.")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+        
+        total_size = 0
+        total_access = 0
+        message_parts = []
+        
+        for i, file in enumerate(files[:50]):
+            file_id, filename, is_video, size, timestamp, access_count = file
+            total_size += size if size else 0
+            total_access += access_count
+            
+            size_mb = size / (1024 * 1024) if size else 0
+            
+            try:
+                date_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                date_str = date_obj.strftime("%b %d, %Y")
+            except:
+                date_str = timestamp
+            
+            message_parts.append(
+                f"🔑 `{file_id}`\n"
+                f"📁 {filename[:30]}{'...' if len(filename) > 30 else ''}\n"
+                f"🎬 {'Video' if is_video else 'Doc'} • {size_mb:.1f}MB • 📅 {date_str} • 👥 {access_count}x\n"
+            )
+        
+        summary = (
+            f"📊 Database Summary:\n"
+            f"• Total files: {len(files)}\n"
+            f"• Total size: {total_size/(1024*1024*1024):.2f} GB\n"
+            f"• Total accesses: {total_access}\n"
+            f"• Storage: PERMANENT (no auto-delete)\n\n"
+            f"📋 Files (showing {min(50, len(files))} of {len(files)}):\n"
+        )
+        
+        full_message = summary + "\n".join(message_parts)
+        
+        if len(full_message) > 4000:
+            sent_msg1 = await update.message.reply_text(full_message[:4000], parse_mode="Markdown")
+            sent_msg2 = await update.message.reply_text(full_message[4000:], parse_mode="Markdown")
+            await schedule_message_deletion(context, sent_msg1.chat_id, sent_msg1.message_id)
+            await schedule_message_deletion(context, sent_msg2.chat_id, sent_msg2.message_id)
+        else:
+            sent_msg = await update.message.reply_text(full_message, parse_mode="Markdown")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            
+    except Exception as e:
+        log.error(f"Error listing files: {e}")
+        sent_msg = await update.message.reply_text(f"❌ Error listing files: {str(e)[:200]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -633,20 +707,84 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_count = db.get_file_count()
     db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
+    
+    total_access = 0
+    try:
+        files = db.get_all_files()
+        total_access = sum(file[5] for file in files)
+    except:
+        pass
 
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         f"📊 Bot Statistics\n\n"
         f"🤖 Bot: @{bot_username}\n"
         f"⏱ Uptime: {uptime_str}\n"
-        f"📁 Files: {file_count}\n"
+        f"📁 Files in database: {file_count}\n"
+        f"👥 Total accesses: {total_access}\n"
         f"💾 DB Size: {db_size:.1f} KB\n"
-        f"🧹 Auto-cleanup: {AUTO_CLEANUP_DAYS} days\n"
-        f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n\n"
+        f"🧹 Auto-cleanup: DISABLED (permanent storage)\n"
+        f"⏰ Media auto-disappear: {DELETE_AFTER//60} minutes\n\n"
         f"📢 Channels:\n"
         f"1. @{CHANNEL_1}\n"
-        f"2. @{CHANNEL_2}"
+        f"2. @{CHANNEL_2}\n\n"
+        f"⚙️ Admin commands:\n"
+        f"/listfiles - View all files\n"
+        f"/deletefile <key> - Delete specific file\n"
+        f"/cleanup [days] - Manual cleanup (optional)"
     )
-# ============ START COMMAND ============
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    user_id = None
+    if context.args:
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            sent_msg = await update.message.reply_text("Usage: /clearcache [user_id]")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+    
+    db.clear_membership_cache(user_id)
+    
+    if user_id:
+        sent_msg = await update.message.reply_text(f"✅ Cleared cache for user {user_id}")
+    else:
+        sent_msg = await update.message.reply_text("✅ Cleared all membership cache")
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    user_id = update.effective_user.id
+    
+    try:
+        try:
+            member1 = await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
+            ch1_status = f"✅ Accessible - Your status: {member1.status}"
+        except Exception as e:
+            ch1_status = f"❌ Error: {str(e)[:100]}"
+        
+        try:
+            member2 = await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
+            ch2_status = f"✅ Accessible - Your status: {member2.status}"
+        except Exception as e:
+            ch2_status = f"❌ Error: {str(e)[:100]}"
+        
+        sent_msg = await update.message.reply_text(
+            f"🔍 Channel Access Test\n\n"
+            f"Channel 1 (@{CHANNEL_1}):\n{ch1_status}\n\n"
+            f"Channel 2 (@{CHANNEL_2}):\n{ch2_status}"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+    except Exception as e:
+        sent_msg = await update.message.reply_text(f"❌ Test failed: {e}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message:
@@ -656,204 +794,277 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         args = context.args
 
-        # ❗ No file key → just show join info
         if not args:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")]
-            ]
-
-            await update.message.reply_text(
-                "🤖 File Sharing Bot\n\n"
-                "🔗 Use admin-provided links\n"
-                "📢 Join both channels to access files",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-
-        # ✅ File key exists
-        key = args[0]
-
-        file_info = db.get_file(key)
-        if not file_info:
-            await update.message.reply_text("❌ File not found or expired")
-            return
-
-        # Membership check
-        result = await check_membership_async(context.bot, user_id)
-
-        if not result["all_joined"]:
-            # Build detailed message showing which channels are missing
-            text = "🔒 Access Locked\n\n"
-            if not result['channel1']:
-                text += f"❌ Not joined: @{CHANNEL_1}\n"
-            if not result['channel2']:
-                text += f"❌ Not joined: @{CHANNEL_2}\n"
-            text += "\nPlease join both channels to unlock this file 👇"
-            
             keyboard = []
-            if not result['channel1']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
-            if not result['channel2']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
-            
-            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
-            
-            # Add timestamp to prevent "not modified" errors
-            text += f"\n\n🕐 Checked at: {datetime.now().strftime('%H:%M:%S')}"
+            keyboard.append([InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
+            keyboard.append([InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
+            keyboard.append([InlineKeyboardButton("🔄 Check Membership", callback_data="check_membership")])
 
-            await update.message.reply_text(
-                text,
+            sent_msg = await update.message.reply_text(
+                "🤖 *Welcome to File Sharing Bot*\n\n"
+                "🔗 *How to use:*\n"
+                "1️⃣ Use admin-provided links\n"
+                "2️⃣ Join both channels below\n"
+                "3️⃣ Click 'Check Membership' after joining\n\n"
+                f"⚠️ *Note:* Media disappears after {DELETE_AFTER//60} minutes — forward immediately to keep!\n"
+                "💾 *Storage:* Files are stored permanently in database",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # ✅ Send file - user has joined both channels
-        send_as_video, supports_streaming = should_send_as_video(file_info)
+        key = args[0]
+        file_info = db.get_file(key)
+        
+        if not file_info:
+            sent_msg = await update.message.reply_text("❌ File not found. It may have been manually deleted by admin.")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
 
-        if send_as_video and file_info.get("is_video"):
-            sent = await context.bot.send_video(
-                chat_id=chat_id,
-                video=file_info["file_id"],
-                caption=f"📹 {file_info['file_name']}",
-                supports_streaming=supports_streaming
-            )
-        else:
-            sent = await context.bot.send_document(
-                chat_id=chat_id,
-                document=file_info["file_id"],
-                caption=f"📁 {file_info['file_name']}"
-            )
+        result = await check_membership(user_id, context, force_check=True)
+        
+        if not result["all_joined"]:
+            missing_count = len(result["missing_channels"])
+            
+            message_text = "🔒 *Access Required*\n\n"
+            
+            if missing_count == 2:
+                message_text += "⚠️ *You need to join both channels to access this file:*\n"
+                keyboard = [
+                    [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                    [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                ]
+            elif missing_count == 1:
+                missing_channel = result["missing_channels"][0].replace("@", "")
+                channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                
+                message_text += f"⚠️ *You need to join {channel_name} to access this file:*\n"
+                
+                keyboard = [
+                    [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                ]
+            
+            message_text += "\n👉 *Join the channel(s) and then click '✅ Check Again'*"
 
-        # Schedule deletion
-        if sent:
-            context.job_queue.run_once(
-                delete_job,
-                DELETE_AFTER,
-                data={"chat": chat_id, "msg": sent.message_id}
+            sent_msg = await update.message.reply_text(
+                message_text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+
+        # Send file with disappearing timer
+        try:
+            filename = file_info['file_name']
+            ext = filename.lower().split('.')[-1] if '.' in filename else ""
+            
+            warning_msg = (
+                f"\n\n⚠️ *This { 'video' if file_info['is_video'] else 'file' } will disappear in {DELETE_AFTER//60} minutes*\n"
+                f"📤 *Forward to Saved Messages right now to keep it forever*\n"
+                f"💾 *File is stored permanently in database*"
+            )
+            
+            chat_id = update.effective_chat.id
+            
+            if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                sent = await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=file_info["file_id"],
+                    caption=f"🎬 *{filename}*\n📥 Accessed {file_info.get('access_count', 0)} times{warning_msg}",
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    message_auto_delete_timer=DELETE_AFTER,   # <--- THIS MAKES MEDIA DISAPPEAR
+                    protect_content=True                          # prevents save/forward
+                )
+            else:
+                sent = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 *{filename}*\n📥 Accessed {file_info.get('access_count', 0)} times{warning_msg}",
+                    parse_mode="Markdown",
+                    message_auto_delete_timer=DELETE_AFTER,   # <--- THIS MAKES MEDIA DISAPPEAR
+                    protect_content=True
+                )
+            
+            # We do NOT schedule message deletion here → caption stays visible
+            
+        except Exception as e:
+            log.error(f"Error sending file: {e}", exc_info=True)
+            error_msg = str(e).lower()
+            
+            if "file is too big" in error_msg or "too large" in error_msg:
+                text = "❌ File is too large. Maximum size is 50MB for videos."
+            elif "file not found" in error_msg or "invalid file id" in error_msg:
+                text = "❌ File expired from Telegram servers. Please contact admin."
+            elif "forbidden" in error_msg:
+                text = "❌ Bot can't send messages here."
+            else:
+                text = "❌ Failed to send file. Please try again."
+            
+            sent_msg = await update.message.reply_text(text)
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
         log.error(f"Start error: {e}", exc_info=True)
         if update.message:
-            await update.message.reply_text("❌ Error processing request")
+            sent_msg = await update.message.reply_text("❌ Error processing request")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ CALLBACK ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle check membership callback"""
     try:
         query = update.callback_query
         if not query:
             return
-        
-        await query.answer("Checking membership...")
+        await query.answer()
         
         user_id = query.from_user.id
-        data_parts = query.data.split("|")
+        data = query.data
         
-        if len(data_parts) != 2:
-            return
-        
-        action, key = data_parts
-        
-        # Check if file exists
-        file_info = db.get_file(key)
-        if not file_info:
-            await query.edit_message_text("❌ File expired")
-            return
-        
-        # Check membership (ASYNC)
-        result = await check_membership_async(context.bot, user_id)
-        
-        if not result['all_joined']:
-            # Build detailed message
-            text = "❌ Still not joined:\n\n"
+        if data == "check_membership":
+            result = await check_membership(user_id, context, force_check=True)
             
-            if not result['channel1']:
-                text += f"• ❌ @{CHANNEL_1}\n"
-            else:
-                text += f"• ✅ @{CHANNEL_1}\n"
-                
-            if not result['channel2']:
-                text += f"• ❌ @{CHANNEL_2}\n"
-            else:
-                text += f"• ✅ @{CHANNEL_2}\n"
-            
-            # Show errors if any
-            if result['errors']:
-                text += f"\n⚠️ Note: {', '.join(result['errors'])}"
-            
-            text += f"\n\n🔄 Click 'Check Again' after joining"
-            text += f"\n🕐 Last checked: {datetime.now().strftime('%H:%M:%S')}"
-            
-            # Build keyboard
-            keyboard = []
-            if not result['channel1']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
-            if not result['channel2']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
-            keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
-            
-            try:
+            if result["all_joined"]:
                 await query.edit_message_text(
-                    text,
+                    f"✅ *Great! You've joined both channels!*\n\n"
+                    "Now you can use file links shared by the admin.\n"
+                    f"⚠️ *Note:* Media disappears after {DELETE_AFTER//60} minutes — forward immediately!",
+                    parse_mode="Markdown"
+                )
+            else:
+                message_text = "❌ *Membership Check Failed*\n\n"
+                missing_count = len(result["missing_channels"])
+                
+                if missing_count == 2:
+                    message_text += "You're not a member of either channel.\n"
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                        [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
+                    ]
+                elif missing_count == 1:
+                    missing_channel = result["missing_channels"][0].replace("@", "")
+                    channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                    
+                    message_text += f"You're missing {channel_name}.\n"
+                    
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
+                    ]
+                
+                message_text += "\nJoin the channel(s) and check again."
+
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except Exception as e:
-                if "message is not modified" not in str(e).lower():
-                    raise
             return
         
-        # ✅ User has joined both channels
-        filename = file_info.get('file_name', 'file')
-        
-        # Edit the message to show success
-        try:
-            await query.edit_message_text(f"✅ Access granted! Sending file: {filename}...")
-        except:
-            pass
-        
-        # Send the file
-        try:
-            send_as_video, supports_streaming = should_send_as_video(file_info)
+        if data.startswith("check|"):
+            _, key = data.split("|", 1)
             
-            if send_as_video and file_info.get('is_video'):
-                sent_msg = await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=file_info["file_id"],
-                    caption=f"📹 {filename}",
-                    supports_streaming=supports_streaming
-                )
-            else:
-                sent_msg = await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=file_info["file_id"],
-                    caption=f"📁 {filename}"
-                )
+            file_info = db.get_file(key)
+            if not file_info:
+                await query.edit_message_text("❌ File not found. It may have been manually deleted by admin.")
+                return
             
-            # Schedule deletion
-            if sent_msg:
-                context.job_queue.run_once(
-                    delete_job,
-                    DELETE_AFTER,
-                    data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+            result = await check_membership(user_id, context, force_check=True)
+            
+            if not result['all_joined']:
+                text = "❌ *Still Not Joined*\n\n"
+                missing_count = len(result["missing_channels"])
+                
+                if missing_count == 2:
+                    text += "You need to join both channels:\n"
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                        [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                    ]
+                elif missing_count == 1:
+                    missing_channel = result["missing_channels"][0].replace("@", "")
+                    channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                    
+                    text += f"You need to join {channel_name}:\n"
+                    
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                    ]
+                
+                text += "\nJoin and click 'Check Again'"
+                
+                await query.edit_message_text(
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            # Send file with disappearing timer
+            try:
+                filename = file_info.get('file_name', 'file')
+                ext = filename.lower().split('.')[-1] if '.' in filename else ""
+                
+                warning_msg = (
+                    f"\n\n⚠️ *This { 'video' if file_info['is_video'] else 'file' } will disappear in {DELETE_AFTER//60} minutes*\n"
+                    f"📤 *Forward to Saved Messages right now to keep it forever*\n"
+                    f"💾 *File is stored permanently in database*"
                 )
                 
-        except Exception as e:
-            log.error(f"Failed to send file: {e}")
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="❌ Failed to send file. Please try again."
-            )
+                chat_id = query.message.chat_id
+                
+                if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                    sent_msg = await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=file_info["file_id"],
+                        caption=f"🎬 *{filename}*\n📥 Accessed {file_info.get('access_count', 0)} times{warning_msg}",
+                        parse_mode="Markdown",
+                        supports_streaming=True,
+                        message_auto_delete_timer=DELETE_AFTER,
+                        protect_content=True
+                    )
+                else:
+                    sent_msg = await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=file_info["file_id"],
+                        caption=f"📁 *{filename}*\n📥 Accessed {file_info.get('access_count', 0)} times{warning_msg}",
+                        parse_mode="Markdown",
+                        message_auto_delete_timer=DELETE_AFTER,
+                        protect_content=True
+                    )
+                
+                await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
+                # No schedule_message_deletion here → caption stays
+                
+            except Exception as e:
+                log.error(f"Failed to send file in callback: {e}", exc_info=True)
+                error_msg = str(e).lower()
+                
+                if "file is too big" in error_msg or "too large" in error_msg:
+                    text = "❌ File is too large (max 50MB)."
+                elif "file not found" in error_msg or "invalid file id" in error_msg:
+                    text = "❌ File expired from Telegram servers."
+                elif "forbidden" in error_msg:
+                    text = "❌ Bot can't send files here."
+                else:
+                    text = "❌ Failed to send file. Please try again."
+                
+                await query.edit_message_text(text, parse_mode="Markdown")
         
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
-        try:
-            await query.answer("Error occurred. Please try again.", show_alert=True)
-        except:
-            pass
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("An error occurred. Please try again.", show_alert=True)
+            except:
+                pass
 
-# ============ UPLOAD HANDLER (ADMIN ONLY) ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -869,15 +1080,12 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size = 0
         is_video = False
 
-        # 🎥 VIDEO MESSAGE (MP4 etc.)
         if video:
             file_id = video.file_id
             filename = video.file_name or f"video_{int(time.time())}.mp4"
             mime_type = video.mime_type or "video/mp4"
             file_size = video.file_size or 0
             is_video = True
-
-        # 📁 DOCUMENT (MKV, AVI, ZIP, etc.)
         elif document:
             filename = document.file_name or f"document_{int(time.time())}"
             file_id = document.file_id
@@ -885,97 +1093,70 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size = document.file_size or 0
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
             
-            # Check if it's a video document
             if ext in ALL_VIDEO_EXTS:
-                if ext in {"mkv", "avi", "webm", "flv"}:
-                    is_video = False
-                    await msg.reply_text(
-                        f"📁 Document saved\n"
-                        f"Format: {ext.upper()}\n"
-                        "Users will download this file as a document"
-                    )
-                else:
-                    # MP4, MOV, etc. sent as documents
-                    is_video = True
-            else:
-                is_video = False
-
+                is_video = True
         else:
-            await msg.reply_text("❌ Please send a video or document")
+            sent_msg = await msg.reply_text("❌ Please send a video or document")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # 💾 SAVE TO DATABASE
         file_info = {
             "file_name": filename,
             "mime_type": mime_type,
             "is_video": is_video,
-            "size": int(file_size)
+            "size": int(file_size) if file_size else 0
         }
 
         key = db.save_file(file_id, file_info)
-        # 🔗 GENERATE LINK
         link = f"https://t.me/{bot_username}?start={key}"
 
-        await msg.reply_text(
-            f"✅ Upload Successful\n\n"
-            f"📁 Name: {filename}\n"
-            f"🎬 Type: {'Video' if is_video else 'Document'}\n"
-            f"📦 Size: {file_size/1024/1024:.1f} MB\n"
-            f"🔑 Key: {key}\n\n"
-            f"🔗 Link:\n{link}"
+        sent_msg = await msg.reply_text(
+            f"✅ *Upload Successful*\n\n"
+            f"📁 *Name:* `{filename}`\n"
+            f"🎬 *Type:* {'Video' if is_video else 'Document'}\n"
+            f"📦 *Size:* {file_size/1024/1024:.1f} MB\n"
+            f"🔑 *Key:* `{key}`\n"
+            f"⏰ *Media disappears after:* {DELETE_AFTER//60} minutes\n"
+            f"💾 *Storage:* PERMANENT in database\n\n"
+            f"🔗 *Link:*\n`{link}`\n\n"
+            f"⚠️ *Note:* File will be stored FOREVER unless manually deleted",
+            parse_mode="Markdown"
         )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
         log.exception("Upload error")
-        await update.message.reply_text(
-            f"❌ Upload failed:\n{str(e)[:200]}"
-        )
+        sent_msg = await update.message.reply_text(f"❌ Upload failed: {str(e)[:200]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-
-# ============ GET BOT USERNAME ============
-async def get_bot_username(application):
-    """Get bot username dynamically"""
-    try:
-        bot = await application.bot.get_me()
-        return bot.username
-    except Exception as e:
-        log.error(f"Failed to get bot username: {e}")
-        return "xiomovies_bot"  # fallback
-
-# ============ MAIN BOT FUNCTION ============
-async def start_bot_async():
-    """Async version of start_bot"""
-    # ✅ CRITICAL FIX: Check for BOT_TOKEN here too
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: BOT_TOKEN is not set or is still default!")
-        print("💡 Set it as environment variable: BOT_TOKEN=your_bot_token_here")
+def start_bot():
+    if not BOT_TOKEN:
+        print("❌ ERROR: BOT_TOKEN is not set!")
         return
     
     if not ADMIN_ID or ADMIN_ID == 0:
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
-        print("💡 Get your Telegram ID from @userinfobot")
         return
     
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    if application.job_queue:
+        print("🟢 Job queue initialized")
+    else:
+        print("⚠️ Job queue not available - some deletion features limited")
 
-    # Get bot username dynamically
-    global bot_username
-    try:
-        bot_info = await application.bot.get_me()
-        bot_username = bot_info.username
-        print(f"🟢 Bot username detected: @{bot_username}")
-    except Exception as e:
-        print(f"⚠️ Could not get bot username: {e}")
-        print(f"🟢 Using default: @{bot_username}")
-
-    # Handlers (must be async functions!)
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cleanup", cleanup))
     application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("clearcache", clearcache))
+    application.add_handler(CommandHandler("testchannel", testchannel))
+    application.add_handler(CommandHandler("listfiles", listfiles))
+    application.add_handler(CommandHandler("deletefile", deletefile))
+    
+    application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
-    # Upload handler - admin only in private chats
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
@@ -985,62 +1166,48 @@ async def start_bot_async():
     print(f"🟢 Bot username: @{bot_username}")
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print("🟢 Press Ctrl+C to stop")
+    print(f"🟢 Media disappears after: {DELETE_AFTER//60} minutes (message stays)")
+    print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
+    print(f"🟢 Max stored files: {MAX_STORED_FILES}")
     
-    # Run auto cleanup on startup
+    db.clear_membership_cache()
+    
     try:
-        db.cleanup_old_files()
-        print(f"🟢 Database cleanup complete. Files: {db.get_file_count()}")
+        file_count = db.get_file_count()
+        print(f"🟢 Database initialized. Files in database: {file_count}")
     except Exception as e:
-        print(f"⚠️ Database cleanup failed: {e}")
+        print(f"⚠️ Database initialization failed: {e}")
     
-    await application.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
 
-def start_bot():
-    """Wrapper to run async bot"""
-    asyncio.run(start_bot_async())
-
-# ============ MAIN ============
 def main():
     print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT")
+    print("🤖 TELEGRAM FILE BOT - PERMANENT STORAGE + MEDIA AUTO-DISAPPEAR")
     print("=" * 50)
 
-    # ✅ ADD THESE CHECKS
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
-        print("💡 Set it as environment variable or in .env file")
-        print("💡 Example: BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz")
         return
 
     if not ADMIN_ID or ADMIN_ID == 0:
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
-        print("💡 Get your Telegram ID from @userinfobot")
-        print("💡 Example: ADMIN_ID=123456789")
         return
 
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-
-    # Start Flask in a separate thread
-    print("🟢 Starting Flask web dashboard...")
+    print(f"🟢 Media disappears after: {DELETE_AFTER//60} minutes")
+    print(f"🟢 Database storage: PERMANENT (no auto-cleanup)")
+    
+    print("\n🟢 Starting Flask web dashboard...")
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
-    time.sleep(2)  # Let Flask initialize
+    time.sleep(1)
     print(f"🟢 Flask running on port {os.environ.get('PORT', 10000)}")
 
-    # Start Telegram bot in main thread
-    try:
-        start_bot()
-    except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-    except Exception as e:
-        print(f"❌ Bot crashed: {e}")
-        traceback.print_exc()
-
+    start_bot()
 
 if __name__ == "__main__":
     main()
