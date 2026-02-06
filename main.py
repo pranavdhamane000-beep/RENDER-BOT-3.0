@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xoticcroissant_bot"
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -44,7 +44,7 @@ CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
 # SQLite database for persistent storage
 DB_PATH = Path("file_bot.db")
-DELETE_AFTER = 600  # 10 minutes - DELETE ALL BOT MESSAGES
+DELETE_AFTER = 20  # 10 minutes - DELETE ALL BOT MESSAGES
 MAX_STORED_FILES = 1000
 AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
 
