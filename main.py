@@ -1862,7 +1862,8 @@ def main():
     start_bot()
 
 if __name__ == "__main__":
-    main()import asyncio
+    main();
+    import asyncio
 import json
 import logging
 import os
