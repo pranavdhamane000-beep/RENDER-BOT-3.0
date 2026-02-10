@@ -5,17 +5,15 @@ import os
 import sys
 import time
 import traceback
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
-import psycopg2
-from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 
-# Database connection pool
-db_pool = None
+# Database setup with pg8000 (Pure Python)
+import pg8000.native
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -76,71 +74,47 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
-# ================= DATABASE =================
+# ================= DATABASE WITH PG8000 =================
 
-def init_db_pool():
-    """Initialize PostgreSQL connection pool"""
-    global db_pool
+def parse_database_url():
+    """Parse DATABASE_URL into connection parameters"""
     if not DATABASE_URL:
         log.error("DATABASE_URL environment variable is not set!")
         raise ValueError("DATABASE_URL is required for PostgreSQL")
     
-    # Parse DATABASE_URL and create connection parameters
-    # Render's DATABASE_URL format: postgresql://user:password@host:port/database
-    # For SSL, we need to add sslmode=require
-    if "postgres://" in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    # Handle postgres:// URL scheme
+    url_str = DATABASE_URL
+    if url_str.startswith("postgres://"):
+        url_str = url_str.replace("postgres://", "postgresql://", 1)
     
-    # Add SSL mode if not present
-    if "sslmode=" not in DATABASE_URL:
-        if "?" in DATABASE_URL:
-            DATABASE_URL += "&sslmode=require"
-        else:
-            DATABASE_URL += "?sslmode=require"
+    url = urllib.parse.urlparse(url_str)
     
-    try:
-        db_pool = SimpleConnectionPool(
-            minconn=1,
-            maxconn=10,
-            dsn=DATABASE_URL
-        )
-        log.info("PostgreSQL connection pool initialized successfully")
-        
-        # Test connection
-        conn = db_pool.getconn()
-        cursor = conn.cursor()
-        cursor.execute("SELECT version();")
-        version = cursor.fetchone()
-        log.info(f"Connected to PostgreSQL: {version[0]}")
-        db_pool.putconn(conn)
-        
-        return db_pool
-    except Exception as e:
-        log.error(f"Failed to initialize PostgreSQL connection pool: {e}")
-        raise
+    params = {
+        'host': url.hostname,
+        'port': url.port or 5432,
+        'database': url.path[1:],  # Remove leading '/'
+        'user': url.username,
+        'password': url.password,
+    }
+    
+    # Add SSL for Render
+    if 'render.com' in url.hostname or url.port == 5432:
+        params['ssl'] = True
+    
+    log.info(f"Database connection: {params['user']}@{params['host']}:{params['port']}/{params['database']}")
+    return params
 
-@contextmanager
-def get_connection():
-    """Get a connection from the pool"""
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        yield conn
-    except Exception as e:
-        log.error(f"Error getting connection from pool: {e}")
-        raise
-    finally:
-        if conn:
-            db_pool.putconn(conn)
+# Parse connection parameters
+db_params = parse_database_url()
 
 @contextmanager
 def get_cursor():
-    """Get a cursor from the connection pool"""
+    """Get a database cursor"""
     conn = None
     cursor = None
     try:
-        conn = db_pool.getconn()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        conn = pg8000.native.Connection(**db_params)
+        cursor = conn.cursor()
         yield cursor
         conn.commit()
     except Exception as e:
@@ -152,7 +126,7 @@ def get_cursor():
         if cursor:
             cursor.close()
         if conn:
-            db_pool.putconn(conn)
+            conn.close()
 
 class Database:
     def __init__(self):
@@ -220,15 +194,14 @@ class Database:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_access ON files(access_count)')
             
-            log.info("Database tables initialized")
+            log.info("Database tables initialized successfully")
 
     def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID"""
         with get_cursor() as cursor:
             cursor.execute(
                 '''
-                INSERT INTO files
-                (file_id, file_name, mime_type, is_video, file_size, access_count)
+                INSERT INTO files (file_id, file_name, mime_type, is_video, file_size, access_count)
                 VALUES (%s, %s, %s, %s, %s, 0)
                 RETURNING id
                 ''',
@@ -240,8 +213,8 @@ class Database:
                     file_info.get('size', 0)
                 )
             )
-            new_id = cursor.fetchone()['id']
-            return str(new_id)
+            result = cursor.fetchone()
+            return str(result[0])
 
     def get_file(self, file_id: str) -> Optional[dict]:
         """Get file info by ID"""
@@ -254,26 +227,25 @@ class Database:
             row = cursor.fetchone()
             
             if row:
-                # Convert RealDictRow to dict and ensure proper types
-                file_data = dict(row)
+                # Convert tuple to dict
+                file_data = {
+                    'id': str(row[0]),
+                    'file_id': row[1],
+                    'file_name': row[2],
+                    'mime_type': row[3],
+                    'is_video': bool(row[4]),
+                    'size': row[5],
+                    'timestamp': row[6].isoformat() if row[6] else None,
+                    'access_count': row[7]
+                }
                 
                 # Increment access count
                 cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = %s', (file_id,))
                 
-                # Convert PostgreSQL timestamp to string for consistency
-                if file_data.get('timestamp'):
-                    file_data['timestamp'] = file_data['timestamp'].isoformat()
+                # Update access count in returned data
+                file_data['access_count'] += 1
                 
-                return {
-                    'id': str(file_data['id']),
-                    'file_id': file_data['file_id'],
-                    'file_name': file_data['file_name'],
-                    'mime_type': file_data['mime_type'],
-                    'is_video': bool(file_data['is_video']),
-                    'size': file_data['file_size'],
-                    'timestamp': file_data['timestamp'],
-                    'access_count': file_data['access_count'] + 1
-                }
+                return file_data
             return None
     
     def cleanup_old_files(self):
@@ -308,7 +280,8 @@ class Database:
         """Get total number of files"""
         with get_cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM files")
-            return cursor.fetchone()['count']
+            result = cursor.fetchone()
+            return result[0] if result else 0
     
     def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result"""
@@ -329,7 +302,7 @@ class Database:
                 AND timestamp > CURRENT_TIMESTAMP - INTERVAL '5 minutes'
             ''', (user_id, channel))
             row = cursor.fetchone()
-            return row['is_member'] if row else None
+            return bool(row[0]) if row else None
 
     def clear_membership_cache(self, user_id: Optional[int] = None):
         """Clear membership cache for a user or all users"""
@@ -356,11 +329,11 @@ class Database:
                 FROM files ORDER BY timestamp DESC
             ''')
             rows = cursor.fetchall()
-            # Convert to list of tuples for compatibility
+            # Convert to list of tuples
             return [
-                (row['id'], row['file_name'], row['is_video'], 
-                 row['file_size'], row['timestamp'].isoformat() if row['timestamp'] else '', 
-                 row['access_count'])
+                (row[0], row[1], row[2], row[3], 
+                 row[4].isoformat() if row[4] else '', 
+                 row[5])
                 for row in rows
             ]
     
@@ -383,7 +356,8 @@ class Database:
                 SELECT chat_id, message_id FROM scheduled_deletions 
                 WHERE scheduled_time <= CURRENT_TIMESTAMP
             ''')
-            return cursor.fetchall()
+            rows = cursor.fetchall()
+            return [{'chat_id': row[0], 'message_id': row[1]} for row in rows]
     
     def remove_scheduled_message(self, chat_id: int, message_id: int):
         """Remove message from scheduled deletions"""
@@ -405,7 +379,7 @@ class Database:
             
             if exists:
                 # Update existing user
-                cursor.execute('''
+                update_query = '''
                     UPDATE users 
                     SET last_active = CURRENT_TIMESTAMP,
                         total_interactions = total_interactions + 1,
@@ -413,7 +387,8 @@ class Database:
                         first_name = COALESCE(%s, first_name),
                         last_name = COALESCE(%s, last_name)
                     WHERE user_id = %s
-                ''', (username, first_name, last_name, user_id))
+                '''
+                cursor.execute(update_query, (username, first_name, last_name, user_id))
                 
                 if file_accessed:
                     cursor.execute('''
@@ -436,35 +411,35 @@ class Database:
         with get_cursor() as cursor:
             # Total users
             cursor.execute("SELECT COUNT(*) FROM users")
-            total_users = cursor.fetchone()['count']
+            total_users = cursor.fetchone()[0]
             
             # Active users (last 7 days)
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
                 WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
             ''')
-            active_users_7d = cursor.fetchone()['count']
+            active_users_7d = cursor.fetchone()[0]
             
             # Active users (last 30 days)
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
                 WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
             ''')
-            active_users_30d = cursor.fetchone()['count']
+            active_users_30d = cursor.fetchone()[0]
             
             # New users today
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
                 WHERE DATE(first_seen) = CURRENT_DATE
             ''')
-            new_users_today = cursor.fetchone()['count']
+            new_users_today = cursor.fetchone()[0]
             
             # New users this week
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
                 WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
             ''')
-            new_users_week = cursor.fetchone()['count']
+            new_users_week = cursor.fetchone()[0]
             
             # Top 10 users by interactions
             cursor.execute('''
@@ -482,7 +457,7 @@ class Database:
                 SELECT COUNT(DISTINCT user_id) FROM users 
                 WHERE total_files_accessed > 0
             ''')
-            users_with_files = cursor.fetchone()['count']
+            users_with_files = cursor.fetchone()[0]
             
             # Growth statistics
             cursor.execute('''
@@ -497,9 +472,6 @@ class Database:
             ''')
             growth_data = cursor.fetchall()
             
-            # Convert to list of tuples for compatibility
-            growth_tuples = [(row['date'].isoformat(), row['new_users']) for row in growth_data]
-            
             return {
                 'total_users': total_users,
                 'active_users_7d': active_users_7d,
@@ -507,14 +479,13 @@ class Database:
                 'new_users_today': new_users_today,
                 'new_users_week': new_users_week,
                 'top_users': [
-                    (row['user_id'], row['username'], row['first_name'], row['last_name'],
-                     row['total_interactions'], row['total_files_accessed'],
-                     row['last_active'].isoformat() if row['last_active'] else '',
-                     row['first_seen'].isoformat() if row['first_seen'] else '')
+                    (row[0], row[1], row[2], row[3], row[4], row[5],
+                     row[6].isoformat() if row[6] else '',
+                     row[7].isoformat() if row[7] else '')
                     for row in top_users
                 ],
                 'users_with_files': users_with_files,
-                'growth_data': growth_tuples
+                'growth_data': [(row[0].isoformat(), row[1]) for row in growth_data]
             }
     
     def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
@@ -524,18 +495,20 @@ class Database:
                 cursor.execute("SELECT user_id FROM users WHERE user_id != %s", (ADMIN_ID,))
             else:
                 cursor.execute("SELECT user_id FROM users")
-            return [row['user_id'] for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            return [row[0] for row in rows]
     
     def get_user_count(self) -> int:
         """Get total number of users"""
         with get_cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM users")
-            return cursor.fetchone()['count']
+            result = cursor.fetchone()
+            return result[0] if result else 0
 
-# Initialize database connection pool and database
+# Initialize database
 try:
-    init_db_pool()
     db = Database()
+    log.info("Database initialized successfully")
 except Exception as e:
     log.error(f"Failed to initialize database: {e}")
     sys.exit(1)
@@ -818,6 +791,7 @@ def home():
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
             <p>📁 Storage: PERMANENT (no auto-delete)</p>
+            <p>💾 Database: PostgreSQL</p>
         </div>
         
         <div class="info">
@@ -827,16 +801,16 @@ def home():
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
                 <li>Channels: <strong>@{{ channel1 }}, @{{ channel2 }}</strong></li>
                 <li>File Storage: <strong>PERMANENT</strong></li>
+                <li>Database: <strong>PostgreSQL</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
                 <li>Total Users: <strong>{{ user_count }}</strong></li>
-                <li>Database: <strong>PostgreSQL</strong></li>
             </ul>
         </div>
         
         <div class="warning">
             <h3>⚠️ Important Notes</h3>
             <ul>
-                <li>Files are stored <strong>PERMANENTLY</strong> in database</li>
+                <li>Files are stored <strong>PERMANENTLY</strong> in PostgreSQL database</li>
                 <li>Only chat messages auto-delete after {{ delete_minutes }} minutes</li>
                 <li>Users can access same file multiple times forever</li>
                 <li>Admin must manually delete files if needed</li>
@@ -1818,8 +1792,8 @@ def start_bot():
     print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
     print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
     print(f"🟢 Max stored files: {MAX_STORED_FILES}")
-    print(f"🟢 Database: PostgreSQL")
-    print("\n⚡ NEW FEATURES ADDED:")
+    print(f"🟢 Database: PostgreSQL with pg8000")
+    print("\n⚡ FEATURES:")
     print("   /users - User statistics and top users")
     print("   /broadcast - Send messages to all users")
     print("\n⚠️ IMPORTANT: Files are stored PERMANENTLY in PostgreSQL database!")
@@ -1873,6 +1847,7 @@ def main():
     print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
     print(f"🟢 Database storage: PostgreSQL PERMANENT (no auto-cleanup)")
     print(f"🟢 Max files: {MAX_STORED_FILES}")
+    print(f"🟢 PostgreSQL driver: pg8000 (Pure Python)")
     print("\n⚡ FEATURES:")
     print("   /users - User statistics and analytics")
     print("   /broadcast - Send messages to all users")
