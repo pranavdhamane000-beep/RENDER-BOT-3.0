@@ -9,10 +9,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
-import sqlite3
+import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 
-db_lock = threading.Lock()
+# Database connection pool
+db_pool = None
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -42,9 +45,11 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
-# SQLite database for persistent storage
-DB_PATH = Path("file_bot.db")
-DELETE_AFTER = 600  # 10 minutes - DELETE ALL BOT MESSAGES
+# PostgreSQL database URL from Render
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Delete bot messages after (seconds)
+DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 1000
 AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
 
@@ -73,135 +78,201 @@ log = logging.getLogger(__name__)
 
 # ================= DATABASE =================
 
+def init_db_pool():
+    """Initialize PostgreSQL connection pool"""
+    global db_pool
+    if not DATABASE_URL:
+        log.error("DATABASE_URL environment variable is not set!")
+        raise ValueError("DATABASE_URL is required for PostgreSQL")
+    
+    # Parse DATABASE_URL and create connection parameters
+    # Render's DATABASE_URL format: postgresql://user:password@host:port/database
+    # For SSL, we need to add sslmode=require
+    if "postgres://" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    # Add SSL mode if not present
+    if "sslmode=" not in DATABASE_URL:
+        if "?" in DATABASE_URL:
+            DATABASE_URL += "&sslmode=require"
+        else:
+            DATABASE_URL += "?sslmode=require"
+    
+    try:
+        db_pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL
+        )
+        log.info("PostgreSQL connection pool initialized successfully")
+        
+        # Test connection
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT version();")
+        version = cursor.fetchone()
+        log.info(f"Connected to PostgreSQL: {version[0]}")
+        db_pool.putconn(conn)
+        
+        return db_pool
+    except Exception as e:
+        log.error(f"Failed to initialize PostgreSQL connection pool: {e}")
+        raise
+
+@contextmanager
+def get_connection():
+    """Get a connection from the pool"""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        yield conn
+    except Exception as e:
+        log.error(f"Error getting connection from pool: {e}")
+        raise
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+@contextmanager
+def get_cursor():
+    """Get a cursor from the connection pool"""
+    conn = None
+    cursor = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        log.error(f"Database error: {e}")
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            db_pool.putconn(conn)
+
 class Database:
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
+    def __init__(self):
         self.init_db()
     
     def init_db(self):
         """Initialize database with required tables"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
+            # Create files table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS files (
-                    id TEXT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     file_id TEXT NOT NULL,
                     file_name TEXT NOT NULL,
                     mime_type TEXT,
-                    is_video INTEGER DEFAULT 0,
+                    is_video BOOLEAN DEFAULT FALSE,
                     file_size INTEGER DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     access_count INTEGER DEFAULT 0
                 )
             ''')
+            
+            # Create membership_cache table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS membership_cache (
                     user_id INTEGER,
                     channel TEXT,
-                    is_member INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_member BOOLEAN,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
+            
             # Table to track scheduled deletions
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS scheduled_deletions (
-                    chat_id INTEGER NOT NULL,
+                    chat_id BIGINT NOT NULL,
                     message_id INTEGER NOT NULL,
-                    scheduled_time DATETIME NOT NULL,
+                    scheduled_time TIMESTAMP NOT NULL,
                     delete_after INTEGER DEFAULT 600,
                     PRIMARY KEY (chat_id, message_id)
                 )
             ''')
-            # NEW: Users table for tracking user interactions
+            
+            # Users table for tracking user interactions
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
+                    user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
                     last_name TEXT,
-                    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     total_interactions INTEGER DEFAULT 1,
                     total_files_accessed INTEGER DEFAULT 0,
-                    last_file_accessed DATETIME
+                    last_file_accessed TIMESTAMP
                 )
             ''')
+            
+            # Create indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
-            conn.commit()
-
-    @contextmanager
-    def get_connection(self):
-        conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30,
-            check_same_thread=False
-        )
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            yield conn
-        finally:
-            conn.close()
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_access ON files(access_count)')
+            
+            log.info("Database tables initialized")
 
     def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID"""
-        with db_lock:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-
-                cursor.execute(
-                    "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files"
+        with get_cursor() as cursor:
+            cursor.execute(
+                '''
+                INSERT INTO files
+                (file_id, file_name, mime_type, is_video, file_size, access_count)
+                VALUES (%s, %s, %s, %s, %s, 0)
+                RETURNING id
+                ''',
+                (
+                    file_id,
+                    file_info.get('file_name', ''),
+                    file_info.get('mime_type', ''),
+                    file_info.get('is_video', False),
+                    file_info.get('size', 0)
                 )
-                max_id = cursor.fetchone()[0]
-                new_id = str(max_id + 1)
-
-                cursor.execute(
-                    '''
-                    INSERT INTO files
-                    (id, file_id, file_name, mime_type, is_video, file_size, access_count)
-                    VALUES (?, ?, ?, ?, ?, ?, 0)
-                    ''',
-                    (
-                        new_id,
-                        file_id,
-                        file_info.get('file_name', ''),
-                        file_info.get('mime_type', ''),
-                        1 if file_info.get('is_video', False) else 0,
-                        file_info.get('size', 0)
-                    )
-                )
-
-                conn.commit()
-                return new_id
+            )
+            new_id = cursor.fetchone()['id']
+            return str(new_id)
 
     def get_file(self, file_id: str) -> Optional[dict]:
         """Get file info by ID"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
-                SELECT file_id, file_name, mime_type, is_video, file_size, timestamp, access_count
-                FROM files WHERE id = ?
+                SELECT id, file_id, file_name, mime_type, is_video, file_size, 
+                       timestamp, access_count
+                FROM files WHERE id = %s
             ''', (file_id,))
             row = cursor.fetchone()
             
             if row:
+                # Convert RealDictRow to dict and ensure proper types
+                file_data = dict(row)
+                
                 # Increment access count
-                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = ?', (file_id,))
-                conn.commit()
+                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = %s', (file_id,))
+                
+                # Convert PostgreSQL timestamp to string for consistency
+                if file_data.get('timestamp'):
+                    file_data['timestamp'] = file_data['timestamp'].isoformat()
                 
                 return {
-                    'file_id': row[0],
-                    'file_name': row[1],
-                    'mime_type': row[2],
-                    'is_video': bool(row[3]),
-                    'size': row[4],
-                    'timestamp': row[5],
-                    'access_count': row[6] + 1
+                    'id': str(file_data['id']),
+                    'file_id': file_data['file_id'],
+                    'file_name': file_data['file_name'],
+                    'mime_type': file_data['mime_type'],
+                    'is_video': bool(file_data['is_video']),
+                    'size': file_data['file_size'],
+                    'timestamp': file_data['timestamp'],
+                    'access_count': file_data['access_count'] + 1
                 }
             return None
     
@@ -211,12 +282,11 @@ class Database:
             log.info("Auto-cleanup DISABLED (AUTO_CLEANUP_DAYS = 0). Files will be kept forever.")
             return
         
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
                 DELETE FROM files 
-                WHERE timestamp < datetime('now', ?)
-            ''', (f'-{AUTO_CLEANUP_DAYS} days',))
+                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL %s
+            ''', (f'{AUTO_CLEANUP_DAYS} days',))
             
             deleted = cursor.rowcount
             if deleted > 0:
@@ -227,117 +297,110 @@ class Database:
                 WHERE id NOT IN (
                     SELECT id FROM files 
                     ORDER BY timestamp DESC 
-                    LIMIT ?
+                    LIMIT %s
                 )
             ''', (MAX_STORED_FILES,))
             
             if cursor.rowcount > 0:
                 log.info(f"Limited files to {MAX_STORED_FILES} in database")
-            
-            conn.commit()
     
     def get_file_count(self) -> int:
         """Get total number of files"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM files")
-            return cursor.fetchone()[0]
+            return cursor.fetchone()['count']
     
     def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
-                INSERT OR REPLACE INTO membership_cache (user_id, channel, is_member, timestamp)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ''', (user_id, channel, 1 if is_member else 0))
-            conn.commit()
+                INSERT INTO membership_cache (user_id, channel, is_member, timestamp)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id, channel) 
+                DO UPDATE SET is_member = EXCLUDED.is_member, timestamp = EXCLUDED.timestamp
+            ''', (user_id, channel, is_member))
     
     def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
         """Get cached membership result (valid for 5 minutes)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
                 SELECT is_member FROM membership_cache 
-                WHERE user_id = ? AND channel = ? 
-                AND timestamp > datetime('now', '-5 minutes')
+                WHERE user_id = %s AND channel = %s 
+                AND timestamp > CURRENT_TIMESTAMP - INTERVAL '5 minutes'
             ''', (user_id, channel))
             row = cursor.fetchone()
-            return bool(row[0]) if row else None
+            return row['is_member'] if row else None
 
     def clear_membership_cache(self, user_id: Optional[int] = None):
         """Clear membership cache for a user or all users"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             if user_id:
-                cursor.execute("DELETE FROM membership_cache WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
                 log.info(f"Cleared cache for user {user_id}")
             else:
                 cursor.execute("DELETE FROM membership_cache")
                 log.info("Cleared all membership cache")
-            conn.commit()
 
     def delete_file(self, file_id: str) -> bool:
         """Manually delete a file from database (admin only)"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        with get_cursor() as cursor:
+            cursor.execute("DELETE FROM files WHERE id = %s", (file_id,))
             deleted = cursor.rowcount > 0
-            conn.commit()
             return deleted
 
     def get_all_files(self) -> list:
         """Get all files for admin view"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
                 SELECT id, file_name, is_video, file_size, timestamp, access_count 
                 FROM files ORDER BY timestamp DESC
             ''')
-            return cursor.fetchall()
+            rows = cursor.fetchall()
+            # Convert to list of tuples for compatibility
+            return [
+                (row['id'], row['file_name'], row['is_video'], 
+                 row['file_size'], row['timestamp'].isoformat() if row['timestamp'] else '', 
+                 row['access_count'])
+                for row in rows
+            ]
     
     def schedule_message_deletion(self, chat_id: int, message_id: int):
         """Schedule a message for deletion in database"""
         scheduled_time = datetime.now() + timedelta(seconds=DELETE_AFTER)
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
-                INSERT OR REPLACE INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id, message_id) 
+                DO UPDATE SET scheduled_time = EXCLUDED.scheduled_time, delete_after = EXCLUDED.delete_after
             ''', (chat_id, message_id, scheduled_time, DELETE_AFTER))
-            conn.commit()
             log.info(f"Scheduled deletion for message {message_id} in chat {chat_id} at {scheduled_time}")
     
     def get_due_messages(self):
         """Get messages that are due for deletion"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
                 SELECT chat_id, message_id FROM scheduled_deletions 
-                WHERE scheduled_time <= datetime('now')
+                WHERE scheduled_time <= CURRENT_TIMESTAMP
             ''')
             return cursor.fetchall()
     
     def remove_scheduled_message(self, chat_id: int, message_id: int):
         """Remove message from scheduled deletions"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = ? AND message_id = ?', 
+        with get_cursor() as cursor:
+            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = %s AND message_id = %s', 
                           (chat_id, message_id))
-            conn.commit()
             log.info(f"Removed scheduled deletion for message {message_id} in chat {chat_id}")
 
-    # ============ NEW: USER TRACKING FUNCTIONS ============
+    # ============ USER TRACKING FUNCTIONS ============
     
     def update_user_interaction(self, user_id: int, username: str = None, 
                                first_name: str = None, last_name: str = None,
                                file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        with get_cursor() as cursor:
             # Check if user exists
-            cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
             exists = cursor.fetchone()
             
             if exists:
@@ -346,10 +409,10 @@ class Database:
                     UPDATE users 
                     SET last_active = CURRENT_TIMESTAMP,
                         total_interactions = total_interactions + 1,
-                        username = COALESCE(?, username),
-                        first_name = COALESCE(?, first_name),
-                        last_name = COALESCE(?, last_name)
-                    WHERE user_id = ?
+                        username = COALESCE(%s, username),
+                        first_name = COALESCE(%s, first_name),
+                        last_name = COALESCE(%s, last_name)
+                    WHERE user_id = %s
                 ''', (username, first_name, last_name, user_id))
                 
                 if file_accessed:
@@ -357,54 +420,51 @@ class Database:
                         UPDATE users 
                         SET total_files_accessed = total_files_accessed + 1,
                             last_file_accessed = CURRENT_TIMESTAMP
-                        WHERE user_id = ?
+                        WHERE user_id = %s
                     ''', (user_id,))
             else:
                 # Insert new user
                 cursor.execute('''
                     INSERT INTO users 
                     (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                    ON CONFLICT (user_id) DO NOTHING
                 ''', (user_id, username, first_name, last_name))
-            
-            conn.commit()
     
     def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        with get_cursor() as cursor:
             # Total users
             cursor.execute("SELECT COUNT(*) FROM users")
-            total_users = cursor.fetchone()[0]
+            total_users = cursor.fetchone()['count']
             
             # Active users (last 7 days)
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE last_active > datetime('now', '-7 days')
+                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
             ''')
-            active_users_7d = cursor.fetchone()[0]
+            active_users_7d = cursor.fetchone()['count']
             
             # Active users (last 30 days)
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE last_active > datetime('now', '-30 days')
+                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
             ''')
-            active_users_30d = cursor.fetchone()[0]
+            active_users_30d = cursor.fetchone()['count']
             
             # New users today
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE date(first_seen) = date('now')
+                WHERE DATE(first_seen) = CURRENT_DATE
             ''')
-            new_users_today = cursor.fetchone()[0]
+            new_users_today = cursor.fetchone()['count']
             
             # New users this week
             cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE first_seen > datetime('now', '-7 days')
+                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
             ''')
-            new_users_week = cursor.fetchone()[0]
+            new_users_week = cursor.fetchone()['count']
             
             # Top 10 users by interactions
             cursor.execute('''
@@ -422,20 +482,23 @@ class Database:
                 SELECT COUNT(DISTINCT user_id) FROM users 
                 WHERE total_files_accessed > 0
             ''')
-            users_with_files = cursor.fetchone()[0]
+            users_with_files = cursor.fetchone()['count']
             
             # Growth statistics
             cursor.execute('''
                 SELECT 
-                    strftime('%Y-%m-%d', first_seen) as date,
+                    DATE(first_seen) as date,
                     COUNT(*) as new_users
                 FROM users
-                WHERE first_seen > datetime('now', '-30 days')
-                GROUP BY date
+                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                GROUP BY DATE(first_seen)
                 ORDER BY date DESC
                 LIMIT 15
             ''')
             growth_data = cursor.fetchall()
+            
+            # Convert to list of tuples for compatibility
+            growth_tuples = [(row['date'].isoformat(), row['new_users']) for row in growth_data]
             
             return {
                 'total_users': total_users,
@@ -443,30 +506,39 @@ class Database:
                 'active_users_30d': active_users_30d,
                 'new_users_today': new_users_today,
                 'new_users_week': new_users_week,
-                'top_users': top_users,
+                'top_users': [
+                    (row['user_id'], row['username'], row['first_name'], row['last_name'],
+                     row['total_interactions'], row['total_files_accessed'],
+                     row['last_active'].isoformat() if row['last_active'] else '',
+                     row['first_seen'].isoformat() if row['first_seen'] else '')
+                    for row in top_users
+                ],
                 'users_with_files': users_with_files,
-                'growth_data': growth_data
+                'growth_data': growth_tuples
             }
     
     def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
         """Get all user IDs for broadcasting"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             if exclude_admin:
-                cursor.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_ID,))
+                cursor.execute("SELECT user_id FROM users WHERE user_id != %s", (ADMIN_ID,))
             else:
                 cursor.execute("SELECT user_id FROM users")
-            return [row[0] for row in cursor.fetchall()]
+            return [row['user_id'] for row in cursor.fetchall()]
     
     def get_user_count(self) -> int:
         """Get total number of users"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute("SELECT COUNT(*) FROM users")
-            return cursor.fetchone()[0]
+            return cursor.fetchone()['count']
 
-# Initialize database
-db = Database()
+# Initialize database connection pool and database
+try:
+    init_db_pool()
+    db = Database()
+except Exception as e:
+    log.error(f"Failed to initialize database: {e}")
+    sys.exit(1)
 
 # ============ FIXED MESSAGE DELETION SYSTEM ============
 async def delete_message_job(context):
@@ -536,7 +608,9 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
         
         log.info(f"Found {len(due_messages)} overdue messages to clean up")
         
-        for chat_id, message_id in due_messages:
+        for msg in due_messages:
+            chat_id = msg['chat_id']
+            message_id = msg['message_id']
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
                 log.info(f"✅ Cleanup: Deleted overdue message {message_id} from chat {chat_id}")
@@ -755,6 +829,7 @@ def home():
                 <li>File Storage: <strong>PERMANENT</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
                 <li>Total Users: <strong>{{ user_count }}</strong></li>
+                <li>Database: <strong>PostgreSQL</strong></li>
             </ul>
         </div>
         
@@ -765,6 +840,7 @@ def home():
                 <li>Only chat messages auto-delete after {{ delete_minutes }} minutes</li>
                 <li>Users can access same file multiple times forever</li>
                 <li>Admin must manually delete files if needed</li>
+                <li>Using <strong>PostgreSQL</strong> for persistent storage</li>
             </ul>
         </div>
         
@@ -774,7 +850,7 @@ def home():
         </div>
         
         <footer style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 10px; font-size: 0.8rem;">
-            <small>Render • {{ current_time }} • v1.1 • Permanent Storage • User Tracking</small>
+            <small>Render • {{ current_time }} • v2.0 • PostgreSQL • User Tracking</small>
         </footer>
     </div>
 </body>
@@ -815,7 +891,7 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "service": "telegram-file-bot",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
-        "database": "sqlite",
+        "database": "postgresql",
         "storage": "permanent",
         "file_count": db.get_file_count(),
         "user_count": user_count
@@ -863,15 +939,13 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
+        with get_cursor() as cursor:
             cursor.execute('''
                 DELETE FROM files 
-                WHERE timestamp < datetime('now', ?)
-            ''', (f'-{days} days',))
+                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL %s
+            ''', (f'{days} days',))
             
             deleted = cursor.rowcount
-            conn.commit()
         
         file_count = db.get_file_count()
         
@@ -954,10 +1028,13 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Format date
             try:
-                date_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                date_str = date_obj.strftime("%b %d, %Y")
+                if timestamp:
+                    date_obj = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    date_str = date_obj.strftime("%b %d, %Y")
+                else:
+                    date_str = "Unknown"
             except:
-                date_str = timestamp
+                date_str = timestamp[:10] if timestamp else "Unknown"
             
             message_parts.append(
                 f"🔑 `{file_id}`\n"
@@ -971,7 +1048,8 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Total files: {len(files)}\n"
             f"• Total size: {total_size/(1024*1024*1024):.2f} GB\n"
             f"• Total accesses: {total_access}\n"
-            f"• Storage: PERMANENT (no auto-delete)\n\n"
+            f"• Storage: PERMANENT (no auto-delete)\n"
+            f"• Database: PostgreSQL\n\n"
             f"📋 Files (showing {min(50, len(files))} of {len(files)}):\n"
         )
         
@@ -1001,7 +1079,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_count = db.get_file_count()
     user_count = db.get_user_count()
-    db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
     
     # Get total access count
     total_access = 0
@@ -1018,7 +1095,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📁 Files in database: {file_count}\n"
         f"👥 Total users: {user_count}\n"
         f"👥 Total accesses: {total_access}\n"
-        f"💾 DB Size: {db_size:.1f} KB\n"
+        f"💾 Database: PostgreSQL\n"
         f"🧹 Auto-cleanup: DISABLED (permanent storage)\n"
         f"⏰ Message auto-delete: {DELETE_AFTER//60} minutes\n\n"
         f"📢 Channels:\n"
@@ -1088,7 +1165,7 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.message.reply_text(f"❌ Test failed: {e}")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ NEW: USERS COMMAND ============
+# ============ USERS COMMAND ============
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user statistics and top users"""
     if update.effective_user.id != ADMIN_ID:
@@ -1115,8 +1192,11 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Format last active time
             try:
-                last_active_dt = datetime.strptime(last_active, "%Y-%m-%d %H:%M:%S")
-                last_active_str = last_active_dt.strftime("%b %d")
+                if last_active:
+                    last_active_dt = datetime.fromisoformat(last_active.replace('Z', '+00:00'))
+                    last_active_str = last_active_dt.strftime("%b %d")
+                else:
+                    last_active_str = "Unknown"
             except:
                 last_active_str = last_active[:10] if last_active else "Unknown"
             
@@ -1150,7 +1230,7 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.message.reply_text(f"❌ Error getting user statistics: {str(e)[:200]}")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ NEW: BROADCAST COMMAND ============
+# ============ BROADCAST COMMAND ============
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users"""
     if update.effective_user.id != ADMIN_ID:
@@ -1317,7 +1397,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "2️⃣ Join both channels below\n"
                 "3️⃣ Click 'Check Membership' after joining\n\n"
                 f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* Files are stored permanently in database",
+                "💾 *Storage:* Files are stored permanently in PostgreSQL database",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -1338,7 +1418,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership(user_id, context, force_check=True)
         
         if not result["all_joined"]:
-            # Show which channels are missing with better UI - FIXED TO SHOW SINGLE BUTTON
+            # Show which channels are missing with better UI
             missing_count = len(result["missing_channels"])
             
             # Create message with cleaner formatting
@@ -1387,7 +1467,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Add warning message to caption
             warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
             warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-            warning_msg += f"💾 *File is stored permanently in database*"
+            warning_msg += f"💾 *File is stored permanently in PostgreSQL database*"
             
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
                 # Send as playable video
@@ -1466,7 +1546,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ *Great! You've joined both channels!*\n\n"
                     "Now you can use file links shared by the admin.\n"
                     f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                    "💾 *Storage:* Files are stored permanently in database",
+                    "💾 *Storage:* Files are stored permanently in PostgreSQL database",
                     parse_mode="Markdown"
                 )
             else:
@@ -1571,7 +1651,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Add warning message to caption
                 warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
                 warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-                warning_msg += f"💾 *File is stored permanently in database*"
+                warning_msg += f"💾 *File is stored permanently in PostgreSQL database*"
                 
                 chat_id = query.message.chat_id
                 
@@ -1671,7 +1751,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 *Size:* {file_size/1024/1024:.1f} MB\n"
             f"🔑 *Key:* `{key}`\n"
             f"⏰ *Message auto-delete:* {DELETE_AFTER//60} minutes\n"
-            f"💾 *Storage:* PERMANENT in database\n\n"
+            f"💾 *Storage:* PERMANENT in PostgreSQL database\n\n"
             f"🔗 *Link:*\n`{link}`\n\n"
             f"⚠️ *Note:* File will be stored FOREVER unless manually deleted",
             parse_mode="Markdown"
@@ -1718,7 +1798,7 @@ def start_bot():
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("listfiles", listfiles))
     application.add_handler(CommandHandler("deletefile", deletefile))
-    # NEW: Add users and broadcast handlers
+    # Add users and broadcast handlers
     application.add_handler(CommandHandler("users", users))
     application.add_handler(CommandHandler("broadcast", broadcast))
     
@@ -1738,10 +1818,11 @@ def start_bot():
     print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
     print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
     print(f"🟢 Max stored files: {MAX_STORED_FILES}")
+    print(f"🟢 Database: PostgreSQL")
     print("\n⚡ NEW FEATURES ADDED:")
     print("   /users - User statistics and top users")
     print("   /broadcast - Send messages to all users")
-    print("\n⚠️ IMPORTANT: Files are stored PERMANENTLY in database!")
+    print("\n⚠️ IMPORTANT: Files are stored PERMANENTLY in PostgreSQL database!")
     print("   Use /listfiles to see all files")
     print("   Use /deletefile <key> to delete specific files")
     print("   Use /cleanup [days] for manual cleanup (optional)")
@@ -1758,7 +1839,7 @@ def start_bot():
         user_count = db.get_user_count()
         print(f"🟢 Database initialized. Files in database: {file_count}")
         print(f"🟢 Users in database: {user_count}")
-        print(f"🟢 Files will be kept FOREVER in database")
+        print(f"🟢 Files will be kept FOREVER in PostgreSQL database")
     except Exception as e:
         print(f"⚠️ Database initialization failed: {e}")
     
@@ -1769,7 +1850,7 @@ def start_bot():
 
 def main():
     print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT - PERMANENT STORAGE")
+    print("🤖 TELEGRAM FILE BOT - POSTGRESQL PERMANENT STORAGE")
     print("=" * 50)
 
     if not BOT_TOKEN:
@@ -1782,15 +1863,20 @@ def main():
         print("💡 Get your Telegram ID from @userinfobot")
         return
 
+    if not DATABASE_URL:
+        print("❌ ERROR: DATABASE_URL is not set!")
+        print("💡 Render provides this automatically when you add PostgreSQL")
+        return
+
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
     print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
-    print(f"🟢 Database storage: PERMANENT (no auto-cleanup)")
+    print(f"🟢 Database storage: PostgreSQL PERMANENT (no auto-cleanup)")
     print(f"🟢 Max files: {MAX_STORED_FILES}")
-    print("\n⚡ NEW FEATURES:")
+    print("\n⚡ FEATURES:")
     print("   /users - User statistics and analytics")
     print("   /broadcast - Send messages to all users")
-    print("\n⚠️ FILES WILL BE STORED FOREVER IN DATABASE!")
+    print("\n⚠️ FILES WILL BE STORED FOREVER IN POSTGRESQL DATABASE!")
     print("   Use /deletefile or /cleanup to manually remove files")
     
     # Start Flask
