@@ -9,10 +9,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
-import asyncpg
-from contextlib import asynccontextmanager
+import sqlite3
+from contextlib import contextmanager
 
-db_lock = asyncio.Lock()
+db_lock = threading.Lock()
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -42,13 +42,18 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
-# PostgreSQL database (Render provides DATABASE_URL)
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is required for PostgreSQL!")
+# ============ 🔥 PERSISTENT DISK STORAGE - SURVIVES RESTARTS 🔥 ============
+# Create persistent disk in Render Dashboard first!
+# Mount path: /opt/render/project/src/data
+PERSISTENT_PATH = Path("/opt/render/project/src/data")
+PERSISTENT_PATH.mkdir(parents=True, exist_ok=True)
+
+# SQLite database on persistent disk - FILES WILL NEVER VANISH!
+DB_PATH = PERSISTENT_PATH / "file_bot.db"
+# ===========================================================================
 
 DELETE_AFTER = 600  # 10 minutes - DELETE ALL BOT MESSAGES
-MAX_STORED_FILES = 1000
+MAX_STORED_FILES = 10000  # Increased since we have persistent storage
 AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
 
 # Playable formats
@@ -74,363 +79,367 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
-# ================= DATABASE (PostgreSQL with asyncpg) =================
+# ================= DATABASE =================
 
 class Database:
-    def __init__(self, db_url: str = DATABASE_URL):
-        self.db_url = db_url
-        self.pool = None
+    def __init__(self, db_path: Path = DB_PATH):
+        self.db_path = db_path
+        log.info(f"📀 Database path: {self.db_path}")
+        log.info(f"📀 Database exists: {self.db_path.exists()}")
+        self.init_db()
     
-    async def init_pool(self):
-        """Initialize connection pool"""
-        self.pool = await asyncpg.create_pool(
-            self.db_url,
-            ssl='require',
-            min_size=1,
-            max_size=10,
-            command_timeout=60
-        )
-    
-    @asynccontextmanager
-    async def get_connection(self):
-        """Get a connection from the pool"""
-        if not self.pool:
-            await self.init_pool()
-        async with self.pool.acquire() as conn:
-            yield conn
-    
-    async def init_db(self):
+    def init_db(self):
         """Initialize database with required tables"""
-        async with self.get_connection() as conn:
-            # Files table - id is auto-incrementing integer (SERIAL)
-            await conn.execute('''
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS files (
-                    id SERIAL PRIMARY KEY,
+                    id TEXT PRIMARY KEY,
                     file_id TEXT NOT NULL,
                     file_name TEXT NOT NULL,
                     mime_type TEXT,
                     is_video INTEGER DEFAULT 0,
-                    file_size BIGINT DEFAULT 0,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    file_size INTEGER DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     access_count INTEGER DEFAULT 0
                 )
             ''')
-            # Membership cache
-            await conn.execute('''
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS membership_cache (
-                    user_id BIGINT,
+                    user_id INTEGER,
                     channel TEXT,
                     is_member INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
-            # Scheduled deletions
-            await conn.execute('''
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS scheduled_deletions (
-                    chat_id BIGINT NOT NULL,
+                    chat_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
-                    scheduled_time TIMESTAMP NOT NULL,
+                    scheduled_time DATETIME NOT NULL,
                     delete_after INTEGER DEFAULT 600,
                     PRIMARY KEY (chat_id, message_id)
                 )
             ''')
-            # Users table
-            await conn.execute('''
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
+                    user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
                     last_name TEXT,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
                     total_interactions INTEGER DEFAULT 1,
                     total_files_accessed INTEGER DEFAULT 0,
-                    last_file_accessed TIMESTAMP
+                    last_file_accessed DATETIME
                 )
             ''')
-            # Indexes
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
-            await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
-    
-    async def save_file(self, file_id: str, file_info: dict) -> str:
-        """Save file info and return generated ID (as string)"""
-        async with db_lock:
-            async with self.get_connection() as conn:
-                row = await conn.fetchrow('''
-                    INSERT INTO files
-                    (file_id, file_name, mime_type, is_video, file_size, access_count)
-                    VALUES ($1, $2, $3, $4, $5, 0)
-                    RETURNING id
-                ''', 
-                    file_id,
-                    file_info.get('file_name', ''),
-                    file_info.get('mime_type', ''),
-                    1 if file_info.get('is_video', False) else 0,
-                    file_info.get('size', 0)
-                )
-                return str(row['id'])
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
+            conn.commit()
+            
+            # Get file count to verify persistence
+            cursor.execute("SELECT COUNT(*) FROM files")
+            file_count = cursor.fetchone()[0]
+            log.info(f"📊 Database initialized with {file_count} existing files")
 
-    async def get_file(self, file_id: str) -> Optional[dict]:
-        """Get file info by ID (ID is string, but stored as integer)"""
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30,
+            check_same_thread=False
+        )
         try:
-            file_id_int = int(file_id)
-        except ValueError:
-            return None
-        
-        async with self.get_connection() as conn:
-            # Update access count and return the row
-            row = await conn.fetchrow('''
-                UPDATE files
-                SET access_count = access_count + 1
-                WHERE id = $1
-                RETURNING file_id, file_name, mime_type, is_video, file_size, 
-                          TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp, 
-                          access_count
-            ''', file_id_int)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
+        finally:
+            conn.close()
+
+    def save_file(self, file_id: str, file_info: dict) -> str:
+        """Save file info and return generated ID"""
+        with db_lock:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM files"
+                )
+                max_id = cursor.fetchone()[0]
+                new_id = str(max_id + 1)
+
+                cursor.execute(
+                    '''
+                    INSERT INTO files
+                    (id, file_id, file_name, mime_type, is_video, file_size, access_count)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    ''',
+                    (
+                        new_id,
+                        file_id,
+                        file_info.get('file_name', ''),
+                        file_info.get('mime_type', ''),
+                        1 if file_info.get('is_video', False) else 0,
+                        file_info.get('size', 0)
+                    )
+                )
+
+                conn.commit()
+                log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
+                return new_id
+
+    def get_file(self, file_id: str) -> Optional[dict]:
+        """Get file info by ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT file_id, file_name, mime_type, is_video, file_size, timestamp, access_count
+                FROM files WHERE id = ?
+            ''', (file_id,))
+            row = cursor.fetchone()
             
             if row:
+                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = ?', (file_id,))
+                conn.commit()
+                
                 return {
-                    'file_id': row['file_id'],
-                    'file_name': row['file_name'],
-                    'mime_type': row['mime_type'],
-                    'is_video': bool(row['is_video']),
-                    'size': row['file_size'],
-                    'timestamp': row['timestamp'],
-                    'access_count': row['access_count']
+                    'file_id': row[0],
+                    'file_name': row[1],
+                    'mime_type': row[2],
+                    'is_video': bool(row[3]),
+                    'size': row[4],
+                    'timestamp': row[5],
+                    'access_count': row[6] + 1
                 }
             return None
     
-    async def cleanup_old_files(self):
+    def cleanup_old_files(self):
         """Remove files older than AUTO_CLEANUP_DAYS - DISABLED when AUTO_CLEANUP_DAYS = 0"""
         if AUTO_CLEANUP_DAYS <= 0:
             log.info("Auto-cleanup DISABLED (AUTO_CLEANUP_DAYS = 0). Files will be kept forever.")
             return
         
-        async with self.get_connection() as conn:
-            async with conn.transaction():
-                # Delete files older than AUTO_CLEANUP_DAYS
-                result = await conn.execute('''
-                    DELETE FROM files 
-                    WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
-                ''', AUTO_CLEANUP_DAYS)
-                
-                # Parse result to get count
-                deleted = int(result.split(' ')[-1]) if result else 0
-                if deleted > 0:
-                    log.info(f"Auto-cleanup removed {deleted} old files from database")
-                
-                # Limit total files to MAX_STORED_FILES (keep newest)
-                result = await conn.execute('''
-                    DELETE FROM files 
-                    WHERE id NOT IN (
-                        SELECT id FROM files 
-                        ORDER BY timestamp DESC 
-                        LIMIT $1
-                    )
-                ''', MAX_STORED_FILES)
-                
-                limited = int(result.split(' ')[-1]) if result else 0
-                if limited > 0:
-                    log.info(f"Limited files to {MAX_STORED_FILES} in database")
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE timestamp < datetime('now', ?)
+            ''', (f'-{AUTO_CLEANUP_DAYS} days',))
+            
+            deleted = cursor.rowcount
+            if deleted > 0:
+                log.info(f"Auto-cleanup removed {deleted} old files from database")
+            
+            cursor.execute('''
+                DELETE FROM files 
+                WHERE id NOT IN (
+                    SELECT id FROM files 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                )
+            ''', (MAX_STORED_FILES,))
+            
+            if cursor.rowcount > 0:
+                log.info(f"Limited files to {MAX_STORED_FILES} in database")
+            
+            conn.commit()
     
-    async def get_file_count(self) -> int:
+    def get_file_count(self) -> int:
         """Get total number of files"""
-        async with self.get_connection() as conn:
-            row = await conn.fetchrow("SELECT COUNT(*) as count FROM files")
-            return row['count']
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM files")
+            return cursor.fetchone()[0]
     
-    async def cache_membership(self, user_id: int, channel: str, is_member: bool):
+    def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result"""
-        async with self.get_connection() as conn:
-            await conn.execute('''
-                INSERT INTO membership_cache (user_id, channel, is_member, timestamp)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-                ON CONFLICT (user_id, channel) DO UPDATE
-                SET is_member = EXCLUDED.is_member,
-                    timestamp = EXCLUDED.timestamp
-            ''', user_id, channel, 1 if is_member else 0)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO membership_cache (user_id, channel, is_member, timestamp)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, channel, 1 if is_member else 0))
+            conn.commit()
     
-    async def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
+    def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
         """Get cached membership result (valid for 5 minutes)"""
-        async with self.get_connection() as conn:
-            row = await conn.fetchrow('''
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
                 SELECT is_member FROM membership_cache 
-                WHERE user_id = $1 AND channel = $2 
-                AND timestamp > CURRENT_TIMESTAMP - INTERVAL '5 minutes'
-            ''', user_id, channel)
-            return bool(row['is_member']) if row else None
+                WHERE user_id = ? AND channel = ? 
+                AND timestamp > datetime('now', '-5 minutes')
+            ''', (user_id, channel))
+            row = cursor.fetchone()
+            return bool(row[0]) if row else None
 
-    async def clear_membership_cache(self, user_id: Optional[int] = None):
+    def clear_membership_cache(self, user_id: Optional[int] = None):
         """Clear membership cache for a user or all users"""
-        async with self.get_connection() as conn:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
             if user_id:
-                await conn.execute("DELETE FROM membership_cache WHERE user_id = $1", user_id)
+                cursor.execute("DELETE FROM membership_cache WHERE user_id = ?", (user_id,))
                 log.info(f"Cleared cache for user {user_id}")
             else:
-                await conn.execute("DELETE FROM membership_cache")
+                cursor.execute("DELETE FROM membership_cache")
                 log.info("Cleared all membership cache")
+            conn.commit()
 
-    async def delete_file(self, file_id: str) -> bool:
+    def delete_file(self, file_id: str) -> bool:
         """Manually delete a file from database (admin only)"""
-        try:
-            file_id_int = int(file_id)
-        except ValueError:
-            return False
-        async with self.get_connection() as conn:
-            result = await conn.execute("DELETE FROM files WHERE id = $1", file_id_int)
-            # Parse result to get count
-            deleted = int(result.split(' ')[-1]) if result else 0
-            return deleted > 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                log.info(f"🗑️ Deleted file {file_id}")
+            return deleted
 
-    async def get_all_files(self) -> list:
+    def get_all_files(self) -> list:
         """Get all files for admin view"""
-        async with self.get_connection() as conn:
-            rows = await conn.fetch('''
-                SELECT id, file_name, is_video, file_size, 
-                       TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp, 
-                       access_count 
-                FROM files 
-                ORDER BY timestamp DESC
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, file_name, is_video, file_size, timestamp, access_count 
+                FROM files ORDER BY timestamp DESC
             ''')
-            return [(row['id'], row['file_name'], row['is_video'], 
-                    row['file_size'], row['timestamp'], row['access_count']) 
-                    for row in rows]
+            return cursor.fetchall()
     
-    async def schedule_message_deletion(self, chat_id: int, message_id: int):
+    def schedule_message_deletion(self, chat_id: int, message_id: int):
         """Schedule a message for deletion in database"""
         scheduled_time = datetime.now() + timedelta(seconds=DELETE_AFTER)
-        async with self.get_connection() as conn:
-            await conn.execute('''
-                INSERT INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (chat_id, message_id) DO UPDATE
-                SET scheduled_time = EXCLUDED.scheduled_time,
-                    delete_after = EXCLUDED.delete_after
-            ''', chat_id, message_id, scheduled_time, DELETE_AFTER)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
+                VALUES (?, ?, ?, ?)
+            ''', (chat_id, message_id, scheduled_time, DELETE_AFTER))
+            conn.commit()
             log.info(f"Scheduled deletion for message {message_id} in chat {chat_id} at {scheduled_time}")
     
-    async def get_due_messages(self):
+    def get_due_messages(self):
         """Get messages that are due for deletion"""
-        async with self.get_connection() as conn:
-            rows = await conn.fetch('''
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
                 SELECT chat_id, message_id FROM scheduled_deletions 
-                WHERE scheduled_time <= CURRENT_TIMESTAMP
+                WHERE scheduled_time <= datetime('now')
             ''')
-            return [(row['chat_id'], row['message_id']) for row in rows]
+            return cursor.fetchall()
     
-    async def remove_scheduled_message(self, chat_id: int, message_id: int):
+    def remove_scheduled_message(self, chat_id: int, message_id: int):
         """Remove message from scheduled deletions"""
-        async with self.get_connection() as conn:
-            await conn.execute('DELETE FROM scheduled_deletions WHERE chat_id = $1 AND message_id = $2', 
-                             chat_id, message_id)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = ? AND message_id = ?', 
+                          (chat_id, message_id))
+            conn.commit()
             log.info(f"Removed scheduled deletion for message {message_id} in chat {chat_id}")
 
     # ============ USER TRACKING FUNCTIONS ============
     
-    async def update_user_interaction(self, user_id: int, username: str = None, 
-                                    first_name: str = None, last_name: str = None,
-                                    file_accessed: bool = False):
+    def update_user_interaction(self, user_id: int, username: str = None, 
+                               first_name: str = None, last_name: str = None,
+                               file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        async with self.get_connection() as conn:
-            async with conn.transaction():
-                # Check if user exists
-                exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                cursor.execute('''
+                    UPDATE users 
+                    SET last_active = CURRENT_TIMESTAMP,
+                        total_interactions = total_interactions + 1,
+                        username = COALESCE(?, username),
+                        first_name = COALESCE(?, first_name),
+                        last_name = COALESCE(?, last_name)
+                    WHERE user_id = ?
+                ''', (username, first_name, last_name, user_id))
                 
-                if exists:
-                    # Update existing user
-                    await conn.execute('''
+                if file_accessed:
+                    cursor.execute('''
                         UPDATE users 
-                        SET last_active = CURRENT_TIMESTAMP,
-                            total_interactions = total_interactions + 1,
-                            username = COALESCE($1, username),
-                            first_name = COALESCE($2, first_name),
-                            last_name = COALESCE($3, last_name)
-                        WHERE user_id = $4
-                    ''', username, first_name, last_name, user_id)
-                    
-                    if file_accessed:
-                        await conn.execute('''
-                            UPDATE users 
-                            SET total_files_accessed = total_files_accessed + 1,
-                                last_file_accessed = CURRENT_TIMESTAMP
-                            WHERE user_id = $1
-                        ''', user_id)
-                else:
-                    # Insert new user
-                    await conn.execute('''
-                        INSERT INTO users 
-                        (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
-                    ''', user_id, username, first_name, last_name)
+                        SET total_files_accessed = total_files_accessed + 1,
+                            last_file_accessed = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
+                    ''', (user_id,))
+            else:
+                cursor.execute('''
+                    INSERT INTO users 
+                    (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                ''', (user_id, username, first_name, last_name))
+            
+            conn.commit()
     
-    async def get_user_stats(self) -> Dict[str, Any]:
+    def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
-        async with self.get_connection() as conn:
-            # Total users
-            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
             
-            # Active users (last 7 days)
-            active_users_7d = await conn.fetchval('''
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
+                WHERE last_active > datetime('now', '-7 days')
             ''')
+            active_users_7d = cursor.fetchone()[0]
             
-            # Active users (last 30 days)
-            active_users_30d = await conn.fetchval('''
+            cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                WHERE last_active > datetime('now', '-30 days')
             ''')
+            active_users_30d = cursor.fetchone()[0]
             
-            # New users today
-            new_users_today = await conn.fetchval('''
+            cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE DATE(first_seen) = CURRENT_DATE
+                WHERE date(first_seen) = date('now')
             ''')
+            new_users_today = cursor.fetchone()[0]
             
-            # New users this week
-            new_users_week = await conn.fetchval('''
+            cursor.execute('''
                 SELECT COUNT(*) FROM users 
-                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
+                WHERE first_seen > datetime('now', '-7 days')
             ''')
+            new_users_week = cursor.fetchone()[0]
             
-            # Top 10 users by interactions
-            top_rows = await conn.fetch('''
+            cursor.execute('''
                 SELECT user_id, username, first_name, last_name, 
                        total_interactions, total_files_accessed,
-                       TO_CHAR(last_active, 'YYYY-MM-DD HH24:MI:SS') as last_active,
-                       TO_CHAR(first_seen, 'YYYY-MM-DD HH24:MI:SS') as first_seen
+                       last_active, first_seen
                 FROM users 
                 ORDER BY total_interactions DESC 
                 LIMIT 10
             ''')
-            top_users = [(
-                row['user_id'], row['username'], row['first_name'], row['last_name'],
-                row['total_interactions'], row['total_files_accessed'],
-                row['last_active'], row['first_seen']
-            ) for row in top_rows]
+            top_users = cursor.fetchall()
             
-            # Users who accessed files
-            users_with_files = await conn.fetchval('''
+            cursor.execute('''
                 SELECT COUNT(DISTINCT user_id) FROM users 
                 WHERE total_files_accessed > 0
             ''')
+            users_with_files = cursor.fetchone()[0]
             
-            # Growth statistics (last 15 days)
-            growth_rows = await conn.fetch('''
+            cursor.execute('''
                 SELECT 
-                    TO_CHAR(first_seen, 'YYYY-MM-DD') as date,
+                    strftime('%Y-%m-%d', first_seen) as date,
                     COUNT(*) as new_users
                 FROM users
-                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                WHERE first_seen > datetime('now', '-30 days')
                 GROUP BY date
                 ORDER BY date DESC
                 LIMIT 15
             ''')
-            growth_data = [(row['date'], row['new_users']) for row in growth_rows]
+            growth_data = cursor.fetchall()
             
             return {
                 'total_users': total_users,
@@ -443,26 +452,24 @@ class Database:
                 'growth_data': growth_data
             }
     
-    async def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
+    def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
         """Get all user IDs for broadcasting"""
-        async with self.get_connection() as conn:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
             if exclude_admin:
-                rows = await conn.fetch("SELECT user_id FROM users WHERE user_id != $1", ADMIN_ID)
+                cursor.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_ID,))
             else:
-                rows = await conn.fetch("SELECT user_id FROM users")
-            return [row['user_id'] for row in rows]
+                cursor.execute("SELECT user_id FROM users")
+            return [row[0] for row in cursor.fetchall()]
     
-    async def get_user_count(self) -> int:
+    def get_user_count(self) -> int:
         """Get total number of users"""
-        async with self.get_connection() as conn:
-            return await conn.fetchval("SELECT COUNT(*) FROM users")
-    
-    async def close(self):
-        """Close database pool"""
-        if self.pool:
-            await self.pool.close()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users")
+            return cursor.fetchone()[0]
 
-# Initialize database (will be initialized properly in main)
+# Initialize database
 db = Database()
 
 # ============ FIXED MESSAGE DELETION SYSTEM ============
@@ -482,18 +489,17 @@ async def delete_message_job(context):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             log.info(f"✅ Successfully deleted message {message_id} from chat {chat_id}")
-            # Remove from scheduled deletions database
-            await db.remove_scheduled_message(chat_id, message_id)
+            db.remove_scheduled_message(chat_id, message_id)
         except Exception as e:
             error_msg = str(e).lower()
             if "message to delete not found" in error_msg:
                 log.info(f"Message {message_id} already deleted from chat {chat_id}")
-                await db.remove_scheduled_message(chat_id, message_id)
+                db.remove_scheduled_message(chat_id, message_id)
             elif "message can't be deleted" in error_msg:
                 log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
             elif "chat not found" in error_msg:
                 log.info(f"Chat {chat_id} not found - message probably already deleted")
-                await db.remove_scheduled_message(chat_id, message_id)
+                db.remove_scheduled_message(chat_id, message_id)
             else:
                 log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
                 
@@ -503,14 +509,12 @@ async def delete_message_job(context):
 async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     """Schedule a message for deletion after DELETE_AFTER seconds"""
     try:
-        # Also store in database as backup
-        await db.schedule_message_deletion(chat_id, message_id)
+        db.schedule_message_deletion(chat_id, message_id)
         
         if not context.job_queue:
             log.warning(f"Job queue not available - will use database backup for message {message_id}")
             return
         
-        # Schedule deletion job
         context.job_queue.run_once(
             delete_message_job,
             DELETE_AFTER,
@@ -525,7 +529,7 @@ async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id:
 async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
     """Clean up any overdue messages from database"""
     try:
-        due_messages = await db.get_due_messages()
+        due_messages = db.get_due_messages()
         if not due_messages:
             return
         
@@ -535,12 +539,12 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
                 log.info(f"✅ Cleanup: Deleted overdue message {message_id} from chat {chat_id}")
-                await db.remove_scheduled_message(chat_id, message_id)
+                db.remove_scheduled_message(chat_id, message_id)
             except Exception as e:
                 error_msg = str(e).lower()
                 if "message to delete not found" in error_msg:
                     log.info(f"Cleanup: Message {message_id} already deleted")
-                    await db.remove_scheduled_message(chat_id, message_id)
+                    db.remove_scheduled_message(chat_id, message_id)
                 elif "message can't be deleted" in error_msg:
                     log.warning(f"Cleanup: Can't delete message {message_id} - insufficient permissions")
                 else:
@@ -549,21 +553,16 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
 
-# ============ FIXED MEMBERSHIP CHECK ============
+# ============ MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
-    """
-    Check if user is in channel
-    Returns True if user is member, False if not or can't check
-    """
-    # Check cache first (unless force_check is True)
+    """Check if user is in channel"""
     if not force_check:
-        cached = await db.get_cached_membership(user_id, channel)
+        cached = db.get_cached_membership(user_id, channel)
         if cached is not None:
             log.info(f"Cache hit for user {user_id} in @{channel}: {cached}")
             return cached
     
     try:
-        # Format channel username properly
         if not channel.startswith("@"):
             channel_username = f"@{channel}"
         else:
@@ -571,19 +570,16 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         
         log.info(f"Checking user {user_id} in {channel_username}")
         
-        # Try to get chat member
         member = await bot.get_chat_member(
             chat_id=channel_username,
             user_id=user_id
         )
         
-        # Check member status
         is_member = member.status in ["member", "administrator", "creator"]
         
         log.info(f"User {user_id} in {channel_username}: status={member.status}, is_member={is_member}")
         
-        # Cache the result
-        await db.cache_membership(user_id, channel.replace("@", ""), is_member)
+        db.cache_membership(user_id, channel.replace("@", ""), is_member)
         
         return is_member
         
@@ -592,7 +588,7 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         log.warning(f"Failed to check user {user_id} in @{channel}: {e}")
         
         if "user not found" in error_msg or "user not participant" in error_msg:
-            await db.cache_membership(user_id, channel.replace("@", ""), False)
+            db.cache_membership(user_id, channel.replace("@", ""), False)
             return False
         elif "chat not found" in error_msg:
             log.error(f"Channel @{channel} not found!")
@@ -614,11 +610,9 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         "missing_channels": []
     }
     
-    # Clear cache for this user when force checking
     if force_check:
-        await db.clear_membership_cache(user_id)
+        db.clear_membership_cache(user_id)
     
-    # Check first channel
     try:
         ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
         result["channel1"] = ch1_result
@@ -628,7 +622,6 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         log.error(f"Error checking channel 1: {e}")
         result["channel1"] = True
     
-    # Check second channel
     try:
         ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
         result["channel2"] = ch2_result
@@ -726,11 +719,11 @@ def home():
         <h1>🤖 Telegram File Bot</h1>
         <div class="status">
             <h3>✅ Status: <strong>ACTIVE</strong></h3>
-            <p>Bot is running on Render</p>
+            <p>Bot is running on Render with Persistent Disk</p>
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
-            <p>📁 Storage: PERMANENT (no auto-delete)</p>
+            <p>📁 Storage: PERSISTENT DISK (survives restarts)</p>
         </div>
         
         <div class="info">
@@ -738,7 +731,7 @@ def home():
             <ul>
                 <li>Service: <strong>Render Web Service</strong></li>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Channels: <strong>@{{ channel1 }}, @{{ channel2 }}</strong></li>
+                <li>Storage: <strong>Persistent Disk - NEVER VANISHES</strong></li>
                 <li>File Storage: <strong>PERMANENT</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
                 <li>Total Users: <strong>{{ user_count }}</strong></li>
@@ -748,7 +741,7 @@ def home():
         <div class="warning">
             <h3>⚠️ Important Notes</h3>
             <ul>
-                <li>Files are stored <strong>PERMANENTLY</strong> in database</li>
+                <li>Files are stored on <strong>PERSISTENT DISK</strong> - survives restarts!</li>
                 <li>Only chat messages auto-delete after {{ delete_minutes }} minutes</li>
                 <li>Users can access same file multiple times forever</li>
                 <li>Admin must manually delete files if needed</li>
@@ -761,7 +754,7 @@ def home():
         </div>
         
         <footer style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 10px; font-size: 0.8rem;">
-            <small>Render • {{ current_time }} • v1.1 • Permanent Storage • User Tracking</small>
+            <small>Render • {{ current_time }} • v1.1 • Persistent Storage • User Tracking</small>
         </footer>
     </div>
 </body>
@@ -774,12 +767,8 @@ def home():
     file_count = 0
     user_count = 0
     try:
-        # Run async function in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        file_count = loop.run_until_complete(db.get_file_count())
-        user_count = loop.run_until_complete(db.get_user_count())
-        loop.close()
+        file_count = db.get_file_count()
+        user_count = db.get_user_count()
     except:
         pass
     
@@ -796,13 +785,8 @@ def home():
 @app.route('/health')
 def health():
     user_count = 0
-    file_count = 0
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        file_count = loop.run_until_complete(db.get_file_count())
-        user_count = loop.run_until_complete(db.get_user_count())
-        loop.close()
+        user_count = db.get_user_count()
     except:
         pass
     
@@ -811,9 +795,9 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "service": "telegram-file-bot",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
-        "database": "postgresql",
-        "storage": "permanent",
-        "file_count": file_count,
+        "database": "sqlite",
+        "storage": "persistent_disk",
+        "file_count": db.get_file_count(),
         "user_count": user_count
     }), 200
 
@@ -859,14 +843,17 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        async with db.get_connection() as conn:
-            result = await conn.execute('''
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
                 DELETE FROM files 
-                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
-            ''', days)
-            deleted = int(result.split(' ')[-1]) if result else 0
+                WHERE timestamp < datetime('now', ?)
+            ''', (f'-{days} days',))
+            
+            deleted = cursor.rowcount
+            conn.commit()
         
-        file_count = await db.get_file_count()
+        file_count = db.get_file_count()
         
         msg = f"🧹 Manual database cleanup complete\n"
         msg += f"📁 Files retained in database: {file_count}\n"
@@ -896,8 +883,7 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     key = context.args[0]
     
-    # First check if file exists
-    file_info = await db.get_file(key)
+    file_info = db.get_file(key)
     if not file_info:
         sent_msg = await update.message.reply_text(f"❌ File with key '{key}' not found in database")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -905,8 +891,7 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     filename = file_info.get('file_name', 'Unknown')
     
-    # Delete from database
-    if await db.delete_file(key):
+    if db.delete_file(key):
         sent_msg = await update.message.reply_text(
             f"✅ File deleted from database\n\n"
             f"🔑 Key: {key}\n"
@@ -924,7 +909,7 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        files = await db.get_all_files()
+        files = db.get_all_files()
         
         if not files:
             sent_msg = await update.message.reply_text("📁 Database is empty. No files stored.")
@@ -935,15 +920,13 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_access = 0
         message_parts = []
         
-        for i, file in enumerate(files[:50]):  # Show first 50 files
+        for i, file in enumerate(files[:50]):
             file_id, filename, is_video, size, timestamp, access_count = file
             total_size += size if size else 0
             total_access += access_count
             
-            # Format size
             size_mb = size / (1024 * 1024) if size else 0
             
-            # Format date
             try:
                 date_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
                 date_str = date_obj.strftime("%b %d, %Y")
@@ -956,20 +939,18 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎬 {'Video' if is_video else 'Doc'} • {size_mb:.1f}MB • 📅 {date_str} • 👥 {access_count}x\n"
             )
         
-        # Summary
         summary = (
             f"📊 Database Summary:\n"
             f"• Total files: {len(files)}\n"
             f"• Total size: {total_size/(1024*1024*1024):.2f} GB\n"
             f"• Total accesses: {total_access}\n"
-            f"• Storage: PERMANENT (no auto-delete)\n\n"
+            f"• Storage: PERMANENT (persistent disk)\n\n"
             f"📋 Files (showing {min(50, len(files))} of {len(files)}):\n"
         )
         
         full_message = summary + "\n".join(message_parts)
         
         if len(full_message) > 4000:
-            # Split if too long
             sent_msg1 = await update.message.reply_text(full_message[:4000], parse_mode="Markdown")
             sent_msg2 = await update.message.reply_text(full_message[4000:], parse_mode="Markdown")
             await schedule_message_deletion(context, sent_msg1.chat_id, sent_msg1.message_id)
@@ -990,13 +971,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
-    file_count = await db.get_file_count()
-    user_count = await db.get_user_count()
+    file_count = db.get_file_count()
+    user_count = db.get_user_count()
+    db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
     
-    # Get total access count
     total_access = 0
     try:
-        files = await db.get_all_files()
+        files = db.get_all_files()
         total_access = sum(file[5] for file in files)
     except:
         pass
@@ -1008,7 +989,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📁 Files in database: {file_count}\n"
         f"👥 Total users: {user_count}\n"
         f"👥 Total accesses: {total_access}\n"
-        f"💾 Database: PostgreSQL (persistent)\n"
+        f"💾 DB Size: {db_size:.1f} KB\n"
+        f"💿 Storage: Persistent Disk - SURVIVES RESTARTS\n"
         f"🧹 Auto-cleanup: DISABLED (permanent storage)\n"
         f"⏰ Message auto-delete: {DELETE_AFTER//60} minutes\n\n"
         f"📢 Channels:\n"
@@ -1037,7 +1019,7 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
     
-    await db.clear_membership_cache(user_id)
+    db.clear_membership_cache(user_id)
     
     if user_id:
         sent_msg = await update.message.reply_text(f"✅ Cleared cache for user {user_id}")
@@ -1054,14 +1036,12 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     try:
-        # Test channel 1
         try:
             member1 = await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
             ch1_status = f"✅ Accessible - Your status: {member1.status}"
         except Exception as e:
             ch1_status = f"❌ Error: {str(e)[:100]}"
         
-        # Test channel 2
         try:
             member2 = await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
             ch2_status = f"✅ Accessible - Your status: {member2.status}"
@@ -1084,15 +1064,12 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Get user statistics
-        stats_data = await db.get_user_stats()
+        stats_data = db.get_user_stats()
         
-        # Format top users
         top_users_text = ""
         for i, user in enumerate(stats_data['top_users'], 1):
             user_id, username, first_name, last_name, interactions, files_accessed, last_active, first_seen = user
             
-            # Format name
             if first_name and last_name:
                 name = f"{first_name} {last_name}"
             elif first_name:
@@ -1102,7 +1079,6 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 name = f"User {user_id}"
             
-            # Format last active time
             try:
                 last_active_dt = datetime.strptime(last_active, "%Y-%m-%d %H:%M:%S")
                 last_active_str = last_active_dt.strftime("%b %d")
@@ -1113,9 +1089,8 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             top_users_text += f"   👤 ID: {user_id} | 🔢 {interactions} int | 📁 {files_accessed} files\n"
             top_users_text += f"   🕐 Last active: {last_active_str}\n"
         
-        # Format growth data
         growth_text = ""
-        for date_str, count in stats_data['growth_data'][:7]:  # Last 7 days
+        for date_str, count in stats_data['growth_data'][:7]:
             growth_text += f"📅 {date_str}: +{count} users\n"
         
         message = (
@@ -1144,7 +1119,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
-    # Check if there's a message to broadcast
     if not context.args and not (update.message.reply_to_message and update.message.reply_to_message.text):
         sent_msg = await update.message.reply_text(
             "📢 *Broadcast Message to All Users*\n\n"
@@ -1159,12 +1133,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Parse arguments
     args = context.args or []
     silent_mode = False
     test_mode = False
     
-    # Check for flags
     if args and args[0] in ['-silent', '-s']:
         silent_mode = True
         args = args[1:]
@@ -1172,7 +1144,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         test_mode = True
         args = args[1:]
     
-    # Get message text
     if update.message.reply_to_message:
         if update.message.reply_to_message.text:
             message_text = update.message.reply_to_message.text
@@ -1190,16 +1161,14 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
-    # Add broadcast header
     if not silent_mode:
         message_text = f"📢 *Broadcast from @{bot_username}*\n\n{message_text}"
     
-    # Get user list
     if test_mode:
         user_ids = [update.effective_user.id]
         sent_msg = await update.message.reply_text("🔄 *TEST MODE:* Sending to yourself only...", parse_mode="Markdown")
     else:
-        user_ids = await db.get_all_user_ids(exclude_admin=True)
+        user_ids = db.get_all_user_ids(exclude_admin=True)
         sent_msg = await update.message.reply_text(
             f"🔄 *BROADCAST STARTED*\n\n"
             f"📤 Sending to: {len(user_ids)} users\n"
@@ -1214,7 +1183,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     failed = 0
     blocked = 0
     
-    # Send to each user
     for i, user_id in enumerate(user_ids):
         try:
             await context.bot.send_message(
@@ -1225,7 +1193,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             successful += 1
             
-            # Update status every 20 users
             if (i + 1) % 20 == 0 and not test_mode:
                 try:
                     await status_msg.edit_text(
@@ -1250,7 +1217,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 failed += 1
             log.warning(f"Failed to send broadcast to {user_id}: {e}")
     
-    # Send final report
     report = (
         f"✅ *BROADCAST COMPLETED*\n\n"
         f"📊 *Statistics:*\n"
@@ -1279,16 +1245,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         args = context.args
 
-        # Update user interaction in database
         user = update.effective_user
-        await db.update_user_interaction(
+        db.update_user_interaction(
             user_id=user.id,
             username=user.username,
             first_name=user.first_name,
             last_name=user.last_name
         )
 
-        # No file key → show join info
         if not args:
             keyboard = []
             keyboard.append([InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
@@ -1302,23 +1266,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "2️⃣ Join both channels below\n"
                 "3️⃣ Click 'Check Membership' after joining\n\n"
                 f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* Files are stored permanently in database",
+                "💾 *Storage:* Files are stored permanently on persistent disk",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # File key exists
         key = args[0]
-        file_info = await db.get_file(key)
+        file_info = db.get_file(key)
         
         if not file_info:
             sent_msg = await update.message.reply_text("❌ File not found. It may have been manually deleted by admin.")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # Check membership (force fresh check for start command)
         result = await check_membership(user_id, context, force_check=True)
         
         if not result["all_joined"]:
@@ -1354,8 +1316,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # User has joined both channels - send the file
-        await db.update_user_interaction(user_id=user_id, file_accessed=True)
+        db.update_user_interaction(user_id=user_id, file_accessed=True)
         
         try:
             filename = file_info['file_name']
@@ -1363,7 +1324,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
             warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-            warning_msg += f"💾 *File is stored permanently in database*"
+            warning_msg += f"💾 *File is stored permanently on persistent disk*"
             
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
                 sent = await context.bot.send_video(
@@ -1417,16 +1378,14 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         data = query.data
         
-        # Update user interaction in database
         user = query.from_user
-        await db.update_user_interaction(
+        db.update_user_interaction(
             user_id=user.id,
             username=user.username,
             first_name=user.first_name,
             last_name=user.last_name
         )
         
-        # Handle membership check without file
         if data == "check_membership":
             result = await check_membership(user_id, context, force_check=True)
             
@@ -1435,7 +1394,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ *Great! You've joined both channels!*\n\n"
                     "Now you can use file links shared by the admin.\n"
                     f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                    "💾 *Storage:* Files are stored permanently in database",
+                    "💾 *Storage:* Files are stored permanently on persistent disk",
                     parse_mode="Markdown"
                 )
             else:
@@ -1469,7 +1428,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         
-        # Handle file access check
         if data.startswith("check|"):
             data_parts = data.split("|")
             if len(data_parts) != 2:
@@ -1477,9 +1435,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             _, key = data_parts
             
-            # Check if file exists in database
             try:
-                file_info = await db.get_file(key)
+                file_info = db.get_file(key)
                 if not file_info:
                     await query.edit_message_text("❌ File not found. It may have been manually deleted by admin.")
                     return
@@ -1488,7 +1445,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Error accessing file. Please try again.")
                 return
             
-            # Check membership with force check
             result = await check_membership(user_id, context, force_check=True)
             
             if not result['all_joined']:
@@ -1522,8 +1478,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # User has joined both channels - send the file
-            await db.update_user_interaction(user_id=user_id, file_accessed=True)
+            db.update_user_interaction(user_id=user_id, file_accessed=True)
             
             try:
                 filename = file_info.get('file_name', 'file')
@@ -1531,7 +1486,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
                 warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-                warning_msg += f"💾 *File is stored permanently in database*"
+                warning_msg += f"💾 *File is stored permanently on persistent disk*"
                 
                 chat_id = query.message.chat_id
                 
@@ -1611,7 +1566,6 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # Save to database
         file_info = {
             "file_name": filename,
             "mime_type": mime_type,
@@ -1619,7 +1573,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "size": int(file_size) if file_size else 0
         }
 
-        key = await db.save_file(file_id, file_info)
+        key = db.save_file(file_id, file_info)
         link = f"https://t.me/{bot_username}?start={key}"
 
         sent_msg = await msg.reply_text(
@@ -1629,7 +1583,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 *Size:* {file_size/1024/1024:.1f} MB\n"
             f"🔑 *Key:* `{key}`\n"
             f"⏰ *Message auto-delete:* {DELETE_AFTER//60} minutes\n"
-            f"💾 *Storage:* PERMANENT in database\n\n"
+            f"💾 *Storage:* PERMANENT on persistent disk\n\n"
             f"🔗 *Link:*\n`{link}`\n\n"
             f"⚠️ *Note:* File will be stored FOREVER unless manually deleted",
             parse_mode="Markdown"
@@ -1641,7 +1595,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.message.reply_text(f"❌ Upload failed: {str(e)[:200]}")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-async def start_bot():
+def start_bot():
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
         return
@@ -1650,17 +1604,10 @@ async def start_bot():
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
         return
     
-    # Initialize database pool
-    await db.init_pool()
-    await db.init_db()
-    
-    # Initialize application with job queue
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Check if job queue is available
     if application.job_queue:
         print("🟢 Job queue initialized")
-        # Add periodic cleanup job (every 5 minutes)
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
             interval=300,
@@ -1670,7 +1617,6 @@ async def start_bot():
     else:
         print("⚠️ Job queue not available - auto-delete feature will not work")
 
-    # Add handlers
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cleanup", cleanup))
@@ -1682,7 +1628,6 @@ async def start_bot():
     application.add_handler(CommandHandler("users", users))
     application.add_handler(CommandHandler("broadcast", broadcast))
     
-    # Add callback query handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
@@ -1691,82 +1636,49 @@ async def start_bot():
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
 
-    print("🟢 Bot is running and listening...")
+    print("\n" + "=" * 60)
+    print("🤖 TELEGRAM FILE BOT - PERSISTENT DISK STORAGE")
+    print("=" * 60)
     print(f"🟢 Bot username: @{bot_username}")
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
-    print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
-    print(f"🟢 Max stored files: {MAX_STORED_FILES}")
-    print(f"🟢 Database: PostgreSQL with asyncpg (persistent)")
+    print(f"🟢 Message auto-delete: {DELETE_AFTER//60} minutes")
+    print(f"🟢 Database path: {DB_PATH}")
+    print(f"🟢 Database exists: {DB_PATH.exists()}")
+    print(f"🟢 Storage: PERSISTENT DISK - SURVIVES RESTARTS!")
+    print("=" * 60)
     
-    # Clear cache on startup
-    await db.clear_membership_cache()
-    
-    # Log storage info
     try:
-        file_count = await db.get_file_count()
-        user_count = await db.get_user_count()
-        print(f"🟢 Database initialized. Files in database: {file_count}")
-        print(f"🟢 Users in database: {user_count}")
-        print(f"🟢 Files will be kept FOREVER in database")
+        file_count = db.get_file_count()
+        user_count = db.get_user_count()
+        print(f"📊 Files in database: {file_count}")
+        print(f"👥 Users in database: {user_count}")
     except Exception as e:
-        print(f"⚠️ Database initialization failed: {e}")
+        print(f"⚠️ Database check failed: {e}")
     
-    # Start polling
-    await application.run_polling(
+    db.clear_membership_cache()
+    
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
 
 def main():
-    print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT - PERMANENT STORAGE (PostgreSQL + asyncpg)")
-    print("=" * 50)
-
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
-        print("💡 Set it as environment variable or in .env file")
         return
 
     if not ADMIN_ID or ADMIN_ID == 0:
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
-        print("💡 Get your Telegram ID from @userinfobot")
         return
 
-    if not DATABASE_URL:
-        print("❌ ERROR: DATABASE_URL is not set!")
-        print("💡 Render provides this automatically when you add a PostgreSQL database.")
-        return
-
-    print(f"🟢 Admin ID: {ADMIN_ID}")
-    print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
-    print(f"🟢 Database storage: PERMANENT (PostgreSQL)")
-    print(f"🟢 Max files: {MAX_STORED_FILES}")
-    
-    # Start Flask
     print("\n🟢 Starting Flask web dashboard...")
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
     time.sleep(1)
     print(f"🟢 Flask running on port {os.environ.get('PORT', 10000)}")
 
-    # Start bot
-    try:
-        asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        print("\n🟢 Bot stopped by user")
-    finally:
-        # Clean up database connection
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(db.close())
-            loop.close()
-        except:
-            pass
+    start_bot()
 
 if __name__ == "__main__":
     main()
-
