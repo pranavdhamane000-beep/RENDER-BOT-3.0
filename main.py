@@ -84,47 +84,53 @@ class Database:
         self.connection_lock = asyncio.Lock()
         log.info(f"📀 Connecting to Render PostgreSQL (OPTIMIZED STORAGE)...")
     
-    async def get_connection(self):
-        """Get or create database connection"""
-        async with self.connection_lock:
-            if self.connection is None:
-                # Parse DATABASE_URL
-                db_string = self.db_url.replace("postgresql://", "").replace("postgres://", "")
-                user_pass, host_port_db = db_string.split("@", 1)
-                user, password = user_pass.split(":", 1)
-                
-                if "/" in host_port_db:
-                    host_port, database = host_port_db.split("/", 1)
-                else:
-                    host_port = host_port_db
-                    database = "postgres"
-                
-                if ":" in host_port:
-                    host, port = host_port.split(":", 1)
-                    port = int(port)
-                else:
-                    host = host_port
-                    port = 5432
-                
-                password = urllib.parse.unquote(password)
-                
-                try:
-                    self.connection = pg8000.connect(
-                        user=user,
-                        password=password,
-                        host=host,
-                        port=port,
-                        database=database,
-                        ssl_context=True,
-                        timeout=30
-                    )
-                    log.info("✅ PostgreSQL connection established")
-                    await self.init_db()
-                except Exception as e:
-                    log.error(f"❌ Failed to connect: {e}")
-                    raise
+  async def get_connection(self):
+    """Get or create database connection"""
+    async with self.connection_lock:
+        if self.connection is None:
+            # Parse DATABASE_URL
+            db_string = self.db_url.replace("postgresql://", "").replace("postgres://", "")
+            user_pass, host_port_db = db_string.split("@", 1)
+            user, password = user_pass.split(":", 1)
             
-            return self.connection
+            if "/" in host_port_db:
+                host_port, database = host_port_db.split("/", 1)
+            else:
+                host_port = host_port_db
+                database = "postgres"
+            
+            if ":" in host_port:
+                host, port = host_port.split(":", 1)
+                port = int(port)
+            else:
+                host = host_port
+                port = 5432
+            
+            password = urllib.parse.unquote(password)
+            
+            try:
+                # ⚠️ IMPORTANT: Create SSL context that doesn't verify certificates
+                import ssl
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                self.connection = pg8000.connect(
+                    user=user,
+                    password=password,
+                    host=host,
+                    port=port,
+                    database=database,
+                    ssl_context=ssl_context,  # Use custom SSL context
+                    timeout=30
+                )
+                log.info("✅ PostgreSQL connection established (SSL verification disabled)")
+                await self.init_db()
+            except Exception as e:
+                log.error(f"❌ Failed to connect: {e}")
+                raise
+        
+        return self.connection
     
     async def execute(self, query: str, params: tuple = None):
         """Execute a query and return cursor"""
