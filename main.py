@@ -13,8 +13,9 @@ import threading
 from contextlib import contextmanager
 import ssl
 
-# Database setup with pg8000 (Pure Python)
-import pg8000.native
+# Database setup with pg8000 (Standard interface, not native)
+import pg8000
+from pg8000 import Connection, Cursor
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -74,7 +75,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
-# ================= DATABASE WITH PG8000 (FIXED SSL FOR RENDER) =================
+# ================= DATABASE WITH PG8000 (STANDARD INTERFACE) =================
 
 def parse_database_url():
     """Parse DATABASE_URL into connection parameters"""
@@ -114,18 +115,21 @@ def get_cursor():
     conn = None
     cursor = None
     try:
-        # Connect with SSL disabled
-        conn = pg8000.native.Connection(
+        # Connect with SSL disabled using standard pg8000
+        conn = pg8000.connect(
             user=db_params['user'],
             password=db_params['password'],
             host=db_params['host'],
             port=db_params['port'],
             database=db_params['database'],
-            ssl_context=ssl_context  # Use SSL context with verification disabled
+            ssl_context=ssl_context
         )
         cursor = conn.cursor()
         yield cursor
+        conn.commit()
     except Exception as e:
+        if conn:
+            conn.rollback()
         log.error(f"Database error: {e}")
         raise
     finally:
@@ -212,14 +216,14 @@ class Database:
             cursor.execute(
                 '''
                 INSERT INTO files (file_id, file_name, mime_type, is_video, file_size, access_count)
-                VALUES ($1, $2, $3, $4, $5, 0)
+                VALUES (%s, %s, %s, %s, %s, 0)
                 RETURNING id
                 ''',
-                file_id,
+                (file_id,
                 file_info.get('file_name', ''),
                 file_info.get('mime_type', ''),
                 file_info.get('is_video', False),
-                file_info.get('size', 0)
+                file_info.get('size', 0))
             )
             result = cursor.fetchone()
             return str(result[0])
@@ -230,8 +234,8 @@ class Database:
             cursor.execute('''
                 SELECT id, file_id, file_name, mime_type, is_video, file_size, 
                        timestamp, access_count
-                FROM files WHERE id = $1
-            ''', file_id)
+                FROM files WHERE id = %s
+            ''', (file_id,))
             row = cursor.fetchone()
             
             if row:
@@ -248,7 +252,9 @@ class Database:
                 }
                 
                 # Increment access count
-                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = $1', file_id)
+                cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = %s', (file_id,))
+                conn = cursor.connection
+                conn.commit()
                 
                 # Update access count in returned data
                 file_data['access_count'] += 1
@@ -265,8 +271,8 @@ class Database:
         with get_cursor() as cursor:
             cursor.execute('''
                 DELETE FROM files 
-                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL $1
-            ''', f'{AUTO_CLEANUP_DAYS} days')
+                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL %s
+            ''', (f'{AUTO_CLEANUP_DAYS} days',))
             
             deleted = cursor.rowcount
             if deleted > 0:
@@ -277,9 +283,9 @@ class Database:
                 WHERE id NOT IN (
                     SELECT id FROM files 
                     ORDER BY timestamp DESC 
-                    LIMIT $1
+                    LIMIT %s
                 )
-            ''', MAX_STORED_FILES)
+            ''', (MAX_STORED_FILES,))
             
             if cursor.rowcount > 0:
                 log.info(f"Limited files to {MAX_STORED_FILES} in database")
@@ -296,19 +302,19 @@ class Database:
         with get_cursor() as cursor:
             cursor.execute('''
                 INSERT INTO membership_cache (user_id, channel, is_member, timestamp)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id, channel) 
                 DO UPDATE SET is_member = EXCLUDED.is_member, timestamp = EXCLUDED.timestamp
-            ''', user_id, channel, is_member)
+            ''', (user_id, channel, is_member))
     
     def get_cached_membership(self, user_id: int, channel: str) -> Optional[bool]:
         """Get cached membership result (valid for 5 minutes)"""
         with get_cursor() as cursor:
             cursor.execute('''
                 SELECT is_member FROM membership_cache 
-                WHERE user_id = $1 AND channel = $2 
+                WHERE user_id = %s AND channel = %s 
                 AND timestamp > CURRENT_TIMESTAMP - INTERVAL '5 minutes'
-            ''', user_id, channel)
+            ''', (user_id, channel))
             row = cursor.fetchone()
             return bool(row[0]) if row else None
 
@@ -316,7 +322,7 @@ class Database:
         """Clear membership cache for a user or all users"""
         with get_cursor() as cursor:
             if user_id:
-                cursor.execute("DELETE FROM membership_cache WHERE user_id = $1", user_id)
+                cursor.execute("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
                 log.info(f"Cleared cache for user {user_id}")
             else:
                 cursor.execute("DELETE FROM membership_cache")
@@ -325,7 +331,7 @@ class Database:
     def delete_file(self, file_id: str) -> bool:
         """Manually delete a file from database (admin only)"""
         with get_cursor() as cursor:
-            cursor.execute("DELETE FROM files WHERE id = $1", file_id)
+            cursor.execute("DELETE FROM files WHERE id = %s", (file_id,))
             deleted = cursor.rowcount > 0
             return deleted
 
@@ -351,10 +357,10 @@ class Database:
         with get_cursor() as cursor:
             cursor.execute('''
                 INSERT INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
-                VALUES ($1, $2, $3, $4)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (chat_id, message_id) 
                 DO UPDATE SET scheduled_time = EXCLUDED.scheduled_time, delete_after = EXCLUDED.delete_after
-            ''', chat_id, message_id, scheduled_time, DELETE_AFTER)
+            ''', (chat_id, message_id, scheduled_time, DELETE_AFTER))
             log.info(f"Scheduled deletion for message {message_id} in chat {chat_id} at {scheduled_time}")
     
     def get_due_messages(self):
@@ -370,8 +376,8 @@ class Database:
     def remove_scheduled_message(self, chat_id: int, message_id: int):
         """Remove message from scheduled deletions"""
         with get_cursor() as cursor:
-            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = $1 AND message_id = $2', 
-                          chat_id, message_id)
+            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = %s AND message_id = %s', 
+                          (chat_id, message_id))
             log.info(f"Removed scheduled deletion for message {message_id} in chat {chat_id}")
 
     # ============ USER TRACKING FUNCTIONS ============
@@ -382,7 +388,7 @@ class Database:
         """Update user interaction timestamp and count"""
         with get_cursor() as cursor:
             # Check if user exists
-            cursor.execute("SELECT 1 FROM users WHERE user_id = $1", user_id)
+            cursor.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
             exists = cursor.fetchone()
             
             if exists:
@@ -391,28 +397,28 @@ class Database:
                     UPDATE users 
                     SET last_active = CURRENT_TIMESTAMP,
                         total_interactions = total_interactions + 1,
-                        username = COALESCE($2, username),
-                        first_name = COALESCE($3, first_name),
-                        last_name = COALESCE($4, last_name)
-                    WHERE user_id = $1
+                        username = COALESCE(%s, username),
+                        first_name = COALESCE(%s, first_name),
+                        last_name = COALESCE(%s, last_name)
+                    WHERE user_id = %s
                 '''
-                cursor.execute(update_query, user_id, username, first_name, last_name)
+                cursor.execute(update_query, (username, first_name, last_name, user_id))
                 
                 if file_accessed:
                     cursor.execute('''
                         UPDATE users 
                         SET total_files_accessed = total_files_accessed + 1,
                             last_file_accessed = CURRENT_TIMESTAMP
-                        WHERE user_id = $1
-                    ''', user_id)
+                        WHERE user_id = %s
+                    ''', (user_id,))
             else:
                 # Insert new user
                 cursor.execute('''
                     INSERT INTO users 
                     (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
                     ON CONFLICT (user_id) DO NOTHING
-                ''', user_id, username, first_name, last_name)
+                ''', (user_id, username, first_name, last_name))
     
     def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
@@ -500,7 +506,7 @@ class Database:
         """Get all user IDs for broadcasting"""
         with get_cursor() as cursor:
             if exclude_admin:
-                cursor.execute("SELECT user_id FROM users WHERE user_id != $1", ADMIN_ID)
+                cursor.execute("SELECT user_id FROM users WHERE user_id != %s", (ADMIN_ID,))
             else:
                 cursor.execute("SELECT user_id FROM users")
             rows = cursor.fetchall()
@@ -908,8 +914,8 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with get_cursor() as cursor:
             cursor.execute('''
                 DELETE FROM files 
-                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL $1
-            ''', f'{days} days')
+                WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL %s
+            ''', (f'{days} days',))
             
             deleted = cursor.rowcount
         
