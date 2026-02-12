@@ -15,7 +15,6 @@ import ssl
 
 # Database setup with pg8000 (Standard interface)
 import pg8000
-from pg8000 import Connection, Cursor
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -25,7 +24,7 @@ app = Flask(__name__)
 start_time = time.time()
 bot_username = "xiomovies_bot"
 
-# ===========================================================
+# ================= TELEGRAM BOT IMPORTS FOR v21.7 =================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -83,7 +82,6 @@ def parse_database_url():
         log.error("DATABASE_URL environment variable is not set!")
         raise ValueError("DATABASE_URL is required for PostgreSQL")
     
-    # Handle postgres:// URL scheme
     url_str = DATABASE_URL
     if url_str.startswith("postgres://"):
         url_str = url_str.replace("postgres://", "postgresql://", 1)
@@ -101,10 +99,9 @@ def parse_database_url():
     log.info(f"Database connection: {params['user']}@{params['host']}:{params['port']}/{params['database']}")
     return params
 
-# Parse connection parameters
 db_params = parse_database_url()
 
-# Create SSL context that doesn't verify certificates (for Render)
+# SSL context for Render
 ssl_context = ssl.create_default_context()
 ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
@@ -146,7 +143,6 @@ class Database:
         """Initialize database with required tables"""
         try:
             with get_cursor() as cursor:
-                # Create files table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS files (
                         id SERIAL PRIMARY KEY,
@@ -160,7 +156,6 @@ class Database:
                     )
                 ''')
                 
-                # Create membership_cache table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS membership_cache (
                         user_id INTEGER,
@@ -171,7 +166,6 @@ class Database:
                     )
                 ''')
                 
-                # Table to track scheduled deletions
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS scheduled_deletions (
                         chat_id BIGINT NOT NULL,
@@ -182,7 +176,6 @@ class Database:
                     )
                 ''')
                 
-                # Users table for tracking user interactions
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS users (
                         user_id BIGINT PRIMARY KEY,
@@ -197,7 +190,6 @@ class Database:
                     )
                 ''')
                 
-                # Create indexes
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
@@ -290,10 +282,8 @@ class Database:
         with get_cursor() as cursor:
             if user_id:
                 cursor.execute("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
-                log.info(f"Cleared cache for user {user_id}")
             else:
                 cursor.execute("DELETE FROM membership_cache")
-                log.info("Cleared all membership cache")
 
     def delete_file(self, file_id: str) -> bool:
         """Manually delete a file from database (admin only)"""
@@ -394,7 +384,7 @@ except Exception as e:
     sys.exit(1)
 
 # ============ MESSAGE DELETION SYSTEM ============
-async def delete_message_job(context):
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     """Delete message after timer"""
     try:
         job = context.job
@@ -598,7 +588,7 @@ def run_flask():
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ BOT HANDLERS ============
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}")
 
@@ -936,13 +926,13 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = []
     
     try:
-        await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
+        await context.bot.get_chat_member(chat_id=f"@{CHANNEL_1}", user_id=user_id)
         status.append(f"✅ Channel 1: @{CHANNEL_1}")
     except Exception as e:
         status.append(f"❌ Channel 1: {str(e)[:30]}")
     
     try:
-        await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
+        await context.bot.get_chat_member(chat_id=f"@{CHANNEL_2}", user_id=user_id)
         status.append(f"✅ Channel 2: @{CHANNEL_2}")
     except Exception as e:
         status.append(f"❌ Channel 2: {str(e)[:30]}")
@@ -962,7 +952,7 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 def main():
     print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL")
+    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL (PTB v21.7)")
     print("=" * 50)
 
     if not BOT_TOKEN:
@@ -988,13 +978,13 @@ def main():
     flask_thread.start()
     time.sleep(2)
     
-    # Create and run bot in asyncio event loop
+    # Create and run bot
     print("🟢 Starting Telegram bot...")
     
-    # Create application
+    # Build application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add job queue if available
+    # Add job queue
     if application.job_queue:
         application.job_queue.run_repeating(cleanup_overdue_messages, interval=300, first=10)
         print("✅ Job queue initialized")
@@ -1009,8 +999,9 @@ def main():
     application.add_handler(CommandHandler("deletefile", deletefile))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("clearcache", clearcache))
-    application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check"))
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check"))
     
+    # Upload handler
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
@@ -1019,7 +1010,7 @@ def main():
     # Clear cache on startup
     db.clear_membership_cache()
     
-    # Run the bot (this will block)
+    # Run the bot
     print("✅ Bot is running. Press Ctrl+C to stop.\n")
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
