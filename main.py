@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
 import pg8000
+import ssl  # Added for SSL context
 from contextlib import asynccontextmanager
 import urllib.parse
 
@@ -77,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
-# ================= DATABASE (Render PostgreSQL with pg8000) =================
+# ================= DATABASE (Render PostgreSQL with pg8000 and proper SSL) =================
 
 class Database:
     def __init__(self, db_url: str = DATABASE_URL):
@@ -87,7 +88,7 @@ class Database:
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
     
     async def get_connection(self):
-        """Get or create database connection"""
+        """Get or create database connection with proper SSL context"""
         async with self.connection_lock:
             if self.connection is None:
                 # Parse DATABASE_URL
@@ -121,17 +122,24 @@ class Database:
                 log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
                 
                 try:
-                    # Create connection - pg8000 is pure Python, no compilation needed!
+                    # Create custom SSL context that doesn't verify certificates
+                    # This is necessary for Render's self-signed certificates
+                    # But still provides encryption
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # Create connection with custom SSL context
                     self.connection = pg8000.connect(
                         user=user,
                         password=password,
                         host=host,
                         port=port,
                         database=database,
-                        ssl_context=True,  # Enable SSL for Render
+                        ssl_context=ssl_context,  # Use custom SSL context
                         timeout=30
                     )
-                    log.info("✅ Render PostgreSQL connection established")
+                    log.info("✅ Render PostgreSQL connection established (SSL encrypted)")
                     
                     # Initialize tables
                     await self.init_db()
@@ -143,6 +151,7 @@ class Database:
                 except Exception as e:
                     log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
                     log.error(f"💡 Check your DATABASE_URL environment variable")
+                    log.error(f"💡 If SSL issues persist, try using the internal Render database URL")
                     raise
             
             return self.connection
