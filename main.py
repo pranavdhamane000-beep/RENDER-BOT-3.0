@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
 import pg8000
-import ssl
+import ssl  # Added for SSL context
 from contextlib import asynccontextmanager
 import urllib.parse
 
@@ -18,7 +18,6 @@ db_lock = asyncio.Lock()
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
-
 app = Flask(__name__)
 
 # Global variables for web dashboard
@@ -86,106 +85,83 @@ class Database:
         self.db_url = db_url
         self.connection = None
         self.connection_lock = asyncio.Lock()
-        self._connection_initialized = False
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
     
     async def get_connection(self):
         """Get or create database connection with proper SSL context"""
-        if self._connection_initialized and self.connection:
-            return self.connection
-            
         async with self.connection_lock:
-            if self._connection_initialized and self.connection:
-                return self.connection
+            if self.connection is None:
+                # Parse DATABASE_URL
+                # Format: postgresql://user:password@host:port/database
                 
-            # Parse DATABASE_URL
-            # Format: postgresql://user:password@host:port/database
-            
-            # Remove postgresql:// prefix
-            db_string = self.db_url.replace("postgresql://", "").replace("postgres://", "")
-            
-            # Split user:password@host:port/database
-            user_pass, host_port_db = db_string.split("@", 1)
-            user, password = user_pass.split(":", 1)
-            
-            # Split host:port/database
-            if "/" in host_port_db:
-                host_port, database = host_port_db.split("/", 1)
-            else:
-                host_port = host_port_db
-                database = "postgres"
-            
-            # Split host:port
-            if ":" in host_port:
-                host, port = host_port.split(":", 1)
-                port = int(port)
-            else:
-                host = host_port
-                port = 5432
-            
-            # URL decode password
-            password = urllib.parse.unquote(password)
-            
-            log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
-            
-            try:
-                # Create custom SSL context that doesn't verify certificates
-                # This is necessary for Render's self-signed certificates
-                # But still provides encryption
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
+                # Remove postgresql:// prefix
+                db_string = self.db_url.replace("postgresql://", "").replace("postgres://", "")
                 
-                # Create connection with custom SSL context
-                self.connection = pg8000.connect(
-                    user=user,
-                    password=password,
-                    host=host,
-                    port=port,
-                    database=database,
-                    ssl_context=ssl_context,  # Use custom SSL context
-                    timeout=30
-                )
-                log.info("✅ Render PostgreSQL connection established (SSL encrypted)")
-                self._connection_initialized = True
+                # Split user:password@host:port/database
+                user_pass, host_port_db = db_string.split("@", 1)
+                user, password = user_pass.split(":", 1)
                 
-                # Initialize tables
-                await self.init_db()
+                # Split host:port/database
+                if "/" in host_port_db:
+                    host_port, database = host_port_db.split("/", 1)
+                else:
+                    host_port = host_port_db
+                    database = "postgres"
                 
-                # Get file count
-                count = await self.get_file_count()
-                log.info(f"📊 Database initialized with {count} existing files")
+                # Split host:port
+                if ":" in host_port:
+                    host, port = host_port.split(":", 1)
+                    port = int(port)
+                else:
+                    host = host_port
+                    port = 5432
                 
-            except Exception as e:
-                log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
-                log.error(f"💡 Check your DATABASE_URL environment variable")
-                log.error(f"💡 If SSL issues persist, try using the internal Render database URL")
-                raise
+                # URL decode password
+                password = urllib.parse.unquote(password)
+                
+                log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
+                
+                try:
+                    # Create custom SSL context that doesn't verify certificates
+                    # This is necessary for Render's self-signed certificates
+                    # But still provides encryption
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # Create connection with custom SSL context
+                    self.connection = pg8000.connect(
+                        user=user,
+                        password=password,
+                        host=host,
+                        port=port,
+                        database=database,
+                        ssl_context=ssl_context,  # Use custom SSL context
+                        timeout=30
+                    )
+                    log.info("✅ Render PostgreSQL connection established (SSL encrypted)")
+                    
+                    # Initialize tables
+                    await self.init_db()
+                    
+                    # Get file count
+                    count = await self.get_file_count()
+                    log.info(f"📊 Database initialized with {count} existing files")
+                    
+                except Exception as e:
+                    log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
+                    log.error(f"💡 Check your DATABASE_URL environment variable")
+                    log.error(f"💡 If SSL issues persist, try using the internal Render database URL")
+                    raise
             
             return self.connection
-    
-    async def ensure_connection(self):
-        """Ensure connection is alive, reconnect if needed"""
-        try:
-            if self.connection:
-                # Test connection
-                await self.execute("SELECT 1")
-                return True
-        except:
-            # Connection dead, reset
-            self.connection = None
-            self._connection_initialized = False
-            
-        # Reconnect
-        await self.get_connection()
-        return True
     
     async def execute(self, query: str, params: tuple = None):
         """Execute a query and return cursor"""
-        await self.ensure_connection()
+        conn = await self.get_connection()
         
         def _execute():
-            cursor = self.connection.cursor()
+            cursor = conn.cursor()
             if params:
                 cursor.execute(query, params)
             else:
@@ -197,8 +173,7 @@ class Database:
     async def fetchrow(self, query: str, params: tuple = None):
         """Fetch one row"""
         cursor = await self.execute(query, params)
-        result = await asyncio.to_thread(cursor.fetchone)
-        return result
+        return await asyncio.to_thread(cursor.fetchone)
     
     async def fetchall(self, query: str, params: tuple = None):
         """Fetch all rows"""
@@ -208,9 +183,10 @@ class Database:
     async def execute_and_commit(self, query: str, params: tuple = None):
         """Execute query and commit"""
         cursor = await self.execute(query, params)
+        conn = await self.get_connection()
         
         def _commit():
-            self.connection.commit()
+            conn.commit()
             return cursor.rowcount
         
         return await asyncio.to_thread(_commit)
@@ -295,8 +271,7 @@ class Database:
                 1 if file_info.get('is_video', False) else 0,
                 file_info.get('size', 0)
             ))
-            await self.ensure_connection()
-            self.connection.commit()
+            await self.get_connection().commit()
             new_id = str(result[0])
             log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
             return new_id
@@ -319,8 +294,7 @@ class Database:
         ''', (file_id_int,))
         
         if result:
-            await self.ensure_connection()
-            self.connection.commit()
+            await self.get_connection().commit()
             return {
                 'file_id': result[0],
                 'file_name': result[1],
@@ -423,7 +397,7 @@ class Database:
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        async with self.connection_lock:
+        async with self.get_connection():
             # Check if user exists
             exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
             
@@ -551,7 +525,6 @@ class Database:
         if self.connection:
             await asyncio.to_thread(self.connection.close)
             self.connection = None
-            self._connection_initialized = False
             log.info("Database connection closed")
 
 # Initialize database
@@ -1363,31 +1336,25 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 async def start_bot():
     """Start the bot"""
-
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
-
+    
     # Initialize database
-    log.info("📀 Initializing database connection...")
     await db.get_connection()
-    log.info("✅ Database connection initialized successfully")
-
+    
     # Create application
-    log.info("🤖 Creating bot application...")
     application = Application.builder().token(BOT_TOKEN).build()
-
-    # Setup cleanup job
+    
+    # Add job queue for cleanup
     if application.job_queue:
-        log.info("⏰ Setting up cleanup job...")
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
             interval=300,
             first=10
         )
-
+    
     # Add handlers
-    log.info("📝 Adding command handlers...")
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
@@ -1398,46 +1365,20 @@ async def start_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
-
-    application.add_handler(
-        CallbackQueryHandler(check_join, pattern="^check_membership$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(check_join, pattern="^check\\|")
-    )
-
+    
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
+    
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
-        MessageHandler(
-            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
-            upload
-        )
+        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
-
-    # Startup stats
-    file_count = await db.get_file_count()
-    user_count = await db.get_user_count()
-
-    log.info("=" * 50)
-    log.info("🤖 BOT STARTED SUCCESSFULLY! 🎉")
-    log.info("=" * 50)
-    log.info(f"📁 Files in database: {file_count}")
-    log.info(f"👥 Users in database: {user_count}")
-    log.info(f"⏱️  Auto-delete: {DELETE_AFTER//60} minutes")
-    log.info(f"💾 Storage: PERMANENT PostgreSQL")
-    log.info("=" * 50)
-
-    # Remove webhook (important for Render polling)
-    log.info("🔗 Removing webhook...")
-    await application.bot.delete_webhook(drop_pending_updates=True)
-
-    # Start polling
-    log.info("📡 Starting polling...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
     
-
-
-
+    log.info("🤖 Bot started successfully")
+    log.info(f"📁 Files in database: {await db.get_file_count()}")
+    log.info(f"👥 Users in database: {await db.get_user_count()}")
+    
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
     """Main function"""
@@ -1451,26 +1392,21 @@ def main():
     print("=" * 60 + "\n")
     
     # Start Flask
-    print("🌐 Starting web server...")
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
-    print(f"✅ Web server running on port {os.environ.get('PORT', 10000)}")
     
     # Start bot
     try:
-        print("🤖 Starting bot...")
         asyncio.run(start_bot())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
+        print("\n🛑 Bot stopped")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        print("🔌 Closing database connection...")
         try:
             asyncio.run(db.close())
         except:
             pass
-        print("✅ Shutdown complete")
 
 if __name__ == "__main__":
     main()
