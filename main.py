@@ -1378,7 +1378,20 @@ async def start_bot():
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
     
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+   await application.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    close_loop=False
+)
+await application.run_polling(
+    allowed_updates=Update.ALL_TYPES,
+    close_loop=False
+)
+
+
+
+# Keep bot alive forever
+await asyncio.Event().wait()
+
 
 def main():
     """Main function"""
