@@ -1363,113 +1363,76 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 async def start_bot():
     """Start the bot"""
-    try:
-        if not BOT_TOKEN or not ADMIN_ID:
-            log.error("Missing BOT_TOKEN or ADMIN_ID")
-            return
+    if not BOT_TOKEN or not ADMIN_ID:
+        log.error("Missing BOT_TOKEN or ADMIN_ID")
+        return
 
-        # Initialize database
-        log.info("📀 Initializing database connection...")
-        await db.get_connection()
-        log.info("✅ Database connection initialized successfully")
+    # Initialize database
+    log.info("📀 Initializing database connection...")
+    await db.get_connection()
+    log.info("✅ Database connection initialized successfully")
 
-        # Create application
-        log.info("🤖 Creating bot application...")
-        application = Application.builder().token(BOT_TOKEN).build()
+    # Create application
+    log.info("🤖 Creating bot application...")
+    application = Application.builder().token(BOT_TOKEN).build()
 
-        # Setup cleanup job
-        if application.job_queue:
-            log.info("⏰ Setting up cleanup job...")
-            application.job_queue.run_repeating(
-                cleanup_overdue_messages,
-                interval=300,
-                first=10
-            )
-
-        # Add handlers
-        log.info("📝 Adding command handlers...")
-        application.add_error_handler(error_handler)
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("listfiles", listfiles))
-        application.add_handler(CommandHandler("deletefile", deletefile))
-        application.add_handler(CommandHandler("users", users))
-        application.add_handler(CommandHandler("broadcast", broadcast))
-        application.add_handler(CommandHandler("clearcache", clearcache))
-        application.add_handler(CommandHandler("testchannel", testchannel))
-        application.add_handler(CommandHandler("cleanup", cleanup))
-
-        application.add_handler(
-            CallbackQueryHandler(check_join, pattern="^check_membership$")
-        )
-        application.add_handler(
-            CallbackQueryHandler(check_join, pattern="^check\\|")
+    # Setup cleanup job
+    if application.job_queue:
+        log.info("⏰ Setting up cleanup job...")
+        application.job_queue.run_repeating(
+            cleanup_overdue_messages,
+            interval=300,
+            first=10
         )
 
-        upload_filter = filters.VIDEO | filters.Document.ALL
-        application.add_handler(
-            MessageHandler(
-                upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
-                upload
-            )
+    # Add handlers
+    log.info("📝 Adding command handlers...")
+    application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("listfiles", listfiles))
+    application.add_handler(CommandHandler("deletefile", deletefile))
+    application.add_handler(CommandHandler("users", users))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("clearcache", clearcache))
+    application.add_handler(CommandHandler("testchannel", testchannel))
+    application.add_handler(CommandHandler("cleanup", cleanup))
+
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check_membership$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check\\|")
+    )
+
+    upload_filter = filters.VIDEO | filters.Document.ALL
+    application.add_handler(
+        MessageHandler(
+            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+            upload
         )
+    )
 
-        # Startup stats
-        file_count = await db.get_file_count()
-        user_count = await db.get_user_count()
+    # Startup stats
+    file_count = await db.get_file_count()
+    user_count = await db.get_user_count()
 
-        log.info("=" * 50)
-        log.info("🤖 BOT STARTED SUCCESSFULLY! 🎉")
-        log.info("=" * 50)
-        log.info(f"📁 Files in database: {file_count}")
-        log.info(f"👥 Users in database: {user_count}")
-        log.info(f"⏱️  Auto-delete: {DELETE_AFTER//60} minutes")
-        log.info(f"💾 Storage: PERMANENT PostgreSQL")
-        log.info("=" * 50)
+    log.info("=" * 50)
+    log.info("🤖 BOT STARTED SUCCESSFULLY! 🎉")
+    log.info("=" * 50)
+    log.info(f"📁 Files in database: {file_count}")
+    log.info(f"👥 Users in database: {user_count}")
+    log.info(f"⏱️  Auto-delete: {DELETE_AFTER//60} minutes")
+    log.info(f"💾 Storage: PERMANENT PostgreSQL")
+    log.info("=" * 50)
 
-        # Remove webhook (important for Render polling)
-        log.info("🔗 Removing webhook...")
-        await application.bot.delete_webhook(drop_pending_updates=True)
+    # Remove webhook (important for Render polling)
+    log.info("🔗 Removing webhook...")
+    await application.bot.delete_webhook(drop_pending_updates=True)
 
-        # Start polling - FIXED: Use run_polling properly
-        log.info("📡 Starting polling...")
-        await application.initialize()
-        await application.start()
-        
-        # Start polling in a non-blocking way
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
-        log.info("✅ Bot is now polling for updates!")
-        
-        # Keep the bot running
-        while True:
-            await asyncio.sleep(1)
-            
-    except Exception as e:
-        log.error(f"Fatal error in start_bot: {e}", exc_info=True)
-        raise
-    finally:
-        # Cleanup
-        log.info("🛑 Stopping bot...")
-        if 'application' in locals():
-            await application.stop()
-        await db.close()
-
-async def main_async():
-    """Async main function"""
-    try:
-        await start_bot()
-    except KeyboardInterrupt:
-        log.info("🛑 Bot stopped by user")
-    except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
-    finally:
-        log.info("🔌 Closing database connection...")
-        await db.close()
-        log.info("✅ Shutdown complete")
+    # Start polling - SIMPLE VERSION
+    log.info("📡 Starting polling...")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
     """Main function"""
@@ -1488,17 +1451,24 @@ def main():
     flask_thread.start()
     print(f"✅ Web server running on port {os.environ.get('PORT', 10000)}")
     
-    # Start bot - FIXED: Use asyncio.run() properly
+    # Create and set event loop for the main thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Start bot
     try:
         print("🤖 Starting bot...")
-        asyncio.run(main_async())
+        loop.run_until_complete(start_bot())
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
         print(f"\n❌ Fatal error: {e}")
     finally:
+        print("🔌 Closing database connection...")
+        try:
+            loop.run_until_complete(db.close())
+        except:
+            pass
+        loop.close()
         print("✅ Bot shutdown complete")
-
-if __name__ == "__main__":
-    main()
