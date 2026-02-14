@@ -1339,13 +1339,13 @@ async def start_bot():
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
-    
+
     # Initialize database
     await db.get_connection()
-    
+
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     # Add job queue for cleanup
     if application.job_queue:
         application.job_queue.run_repeating(
@@ -1353,7 +1353,7 @@ async def start_bot():
             interval=300,
             first=10
         )
-    
+
     # Add handlers
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
@@ -1365,16 +1365,23 @@ async def start_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
-    
-    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
-    application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
-    
+
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check_membership$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check\\|")
+    )
+
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
-        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
+        MessageHandler(
+            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+            upload
+        )
     )
-    
-        log.info("🤖 Bot started successfully")
+
+    log.info("🤖 Bot started successfully")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
 
@@ -1384,12 +1391,6 @@ async def start_bot():
     )
 
 
-
-
-# Keep bot alive forever
-
-
-
 def main():
     """Main function"""
     print("\n" + "=" * 60)
@@ -1397,14 +1398,17 @@ def main():
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL (PERMANENT)")
-    print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
+    print("✅ Database: Render PostgreSQL (PERMANENT)")
+    print("✅ Driver: pg8000 (Pure Python, No Compilation)")
     print("=" * 60 + "\n")
-    
+
     # Start Flask
-    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    flask_thread = threading.Thread(
+        target=run_flask_thread,
+        daemon=True
+    )
     flask_thread.start()
-    
+
     # Start bot
     try:
         asyncio.run(start_bot())
@@ -1415,8 +1419,9 @@ def main():
     finally:
         try:
             asyncio.run(db.close())
-        except:
+        except Exception:
             pass
+
 
 if __name__ == "__main__":
     main()
