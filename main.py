@@ -8,16 +8,15 @@ from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional, Tuple
 
-import pg8000
-from flask import Flask, jsonify, render_template_string
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,   # ✅ ADD HERE
     filters,
     ContextTypes,
 )
+
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
