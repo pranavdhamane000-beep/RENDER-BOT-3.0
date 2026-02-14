@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
 import pg8000
-import ssl  # Added for SSL context
 from contextlib import asynccontextmanager
 import urllib.parse
 
@@ -22,7 +21,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xoticcroissant_bot"
+bot_username = "xiomovies_bot"
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -78,7 +77,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 
-# ================= DATABASE (Render PostgreSQL with pg8000 and proper SSL) =================
+# ================= DATABASE (Render PostgreSQL with pg8000) =================
 
 class Database:
     def __init__(self, db_url: str = DATABASE_URL):
@@ -88,7 +87,7 @@ class Database:
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
     
     async def get_connection(self):
-        """Get or create database connection with proper SSL context"""
+        """Get or create database connection"""
         async with self.connection_lock:
             if self.connection is None:
                 # Parse DATABASE_URL
@@ -122,24 +121,17 @@ class Database:
                 log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
                 
                 try:
-                    # Create custom SSL context that doesn't verify certificates
-                    # This is necessary for Render's self-signed certificates
-                    # But still provides encryption
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
-                    
-                    # Create connection with custom SSL context
+                    # Create connection - pg8000 is pure Python, no compilation needed!
                     self.connection = pg8000.connect(
                         user=user,
                         password=password,
                         host=host,
                         port=port,
                         database=database,
-                        ssl_context=ssl_context,  # Use custom SSL context
+                        ssl_context=True,  # Enable SSL for Render
                         timeout=30
                     )
-                    log.info("✅ Render PostgreSQL connection established (SSL encrypted)")
+                    log.info("✅ Render PostgreSQL connection established")
                     
                     # Initialize tables
                     await self.init_db()
@@ -151,7 +143,6 @@ class Database:
                 except Exception as e:
                     log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
                     log.error(f"💡 Check your DATABASE_URL environment variable")
-                    log.error(f"💡 If SSL issues persist, try using the internal Render database URL")
                     raise
             
             return self.connection
@@ -1339,13 +1330,13 @@ async def start_bot():
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
-
+    
     # Initialize database
     await db.get_connection()
-
+    
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-
+    
     # Add job queue for cleanup
     if application.job_queue:
         application.job_queue.run_repeating(
@@ -1353,10 +1344,9 @@ async def start_bot():
             interval=300,
             first=10
         )
-
-    # Handlers
+    
+    # Add handlers
     application.add_error_handler(error_handler)
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("listfiles", listfiles))
@@ -1366,36 +1356,20 @@ async def start_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
-
-    application.add_handler(
-        CallbackQueryHandler(check_join, pattern="^check_membership$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(check_join, pattern="^check\\|")
-    )
-
+    
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
+    
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
-        MessageHandler(
-            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
-            upload
-        )
+        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
-
-    log.info("🤖 Bot initializing...")
-
-    # 🔥 THIS IS THE IMPORTANT PART
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
+    
     log.info("🤖 Bot started successfully")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
-
-    # Keep alive forever
-    await asyncio.Event().wait()
-
+    
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
     """Main function"""
@@ -1404,17 +1378,14 @@ def main():
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
-    print("✅ Database: Render PostgreSQL (PERMANENT)")
-    print("✅ Driver: pg8000 (Pure Python, No Compilation)")
+    print(f"✅ Database: Render PostgreSQL (PERMANENT)")
+    print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
     print("=" * 60 + "\n")
-
+    
     # Start Flask
-    flask_thread = threading.Thread(
-        target=run_flask_thread,
-        daemon=True
-    )
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
-
+    
     # Start bot
     try:
         asyncio.run(start_bot())
@@ -1425,9 +1396,8 @@ def main():
     finally:
         try:
             asyncio.run(db.close())
-        except Exception:
+        except:
             pass
-
 
 if __name__ == "__main__":
     main()
