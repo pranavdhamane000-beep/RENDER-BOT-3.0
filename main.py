@@ -4,7 +4,6 @@ import logging
 import secrets
 import threading
 import time
-
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional, Tuple
@@ -16,11 +15,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,   # ✅ ADD HERE
     filters,
     ContextTypes,
 )
-
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -40,32 +37,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== DATABASE HELPERS ====================
-import ssl
-import urllib.parse as urlparse
-
 def get_db_connection():
-    try:
-        # Normalize URL
-        db_url = DATABASE_URL
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
-
-        url = urlparse.urlparse(db_url)
-
-        conn = pg8000.connect(
-            user=url.username,
-            password=url.password,
-            host=url.hostname,
-            port=url.port,
-            database=url.path.lstrip("/"),
-            ssl_context=ssl.create_default_context()  # Proper SSL
-        )
-        return conn
-
-    except Exception as e:
-        logger.error(f"Database connection failed: {e}")
-        raise
-
+    """Create a new PostgreSQL connection using pg8000."""
+    conn = pg8000.connect(DATABASE_URL, ssl_context=True)
+    return conn
 
 def init_db():
     """Create tables if they don't exist."""
@@ -416,9 +391,7 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(add_file, file_key, file_id, file_type, mime, name, size)
 
-    bot_username = (await context.bot.get_me()).username
-    share_link = f"https://t.me/{bot_username}?start={file_key}"
-
+    share_link = f"https://t.me/xiomovies_bot?start={file_key}"
     await update.message.reply_text(
         f"✅ File stored!\nKey: `{file_key}`\nShare link: {share_link}",
         parse_mode="Markdown",
