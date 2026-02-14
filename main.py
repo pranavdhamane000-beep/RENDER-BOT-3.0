@@ -1387,7 +1387,7 @@ async def start_bot():
 
 
 # Keep bot alive forever
-await asyncio.Event().wait()
+
 
 
 def main():
