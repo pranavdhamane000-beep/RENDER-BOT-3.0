@@ -1374,18 +1374,15 @@ async def start_bot():
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
     
-    log.info("🤖 Bot started successfully")
+        log.info("🤖 Bot started successfully")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
-    
-   await application.run_polling(
-    allowed_updates=Update.ALL_TYPES,
-    close_loop=False
-)
-await application.run_polling(
-    allowed_updates=Update.ALL_TYPES,
-    close_loop=False
-)
+
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
+    )
+
 
 
 
