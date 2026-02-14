@@ -416,8 +416,8 @@ async def handle_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(add_file, file_key, file_id, file_type, mime, name, size)
 
- bot_username = (await context.bot.get_me()).username
- share_link = f"https://t.me/{bot_username}?start={file_key}"
+    bot_username = (await context.bot.get_me()).username
+    share_link = f"https://t.me/{bot_username}?start={file_key}"
 
     await update.message.reply_text(
         f"✅ File stored!\nKey: `{file_key}`\nShare link: {share_link}",
