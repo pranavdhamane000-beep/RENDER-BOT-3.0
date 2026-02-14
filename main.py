@@ -1354,8 +1354,9 @@ async def start_bot():
             first=10
         )
 
-    # Add handlers
+    # Handlers
     application.add_error_handler(error_handler)
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("listfiles", listfiles))
@@ -1381,14 +1382,19 @@ async def start_bot():
         )
     )
 
+    log.info("🤖 Bot initializing...")
+
+    # 🔥 THIS IS THE IMPORTANT PART
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
     log.info("🤖 Bot started successfully")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
 
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False
-    )
+    # Keep alive forever
+    await asyncio.Event().wait()
 
 
 def main():
