@@ -12,6 +12,7 @@ import threading
 import pg8000
 from contextlib import asynccontextmanager
 import urllib.parse
+import ssl
 
 db_lock = asyncio.Lock()
 
@@ -86,6 +87,13 @@ class Database:
         self.connection_lock = asyncio.Lock()
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
     
+    def create_ssl_context(self):
+        """Create SSL context that accepts self-signed certificates"""
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        return ssl_context
+    
     async def get_connection(self):
         """Get or create database connection"""
         async with self.connection_lock:
@@ -121,6 +129,9 @@ class Database:
                 log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
                 
                 try:
+                    # Create SSL context that accepts self-signed certificates
+                    ssl_context = self.create_ssl_context()
+                    
                     # Create connection - pg8000 is pure Python, no compilation needed!
                     self.connection = pg8000.connect(
                         user=user,
@@ -128,7 +139,7 @@ class Database:
                         host=host,
                         port=port,
                         database=database,
-                        ssl_context=True,  # Enable SSL for Render
+                        ssl_context=ssl_context,  # Use custom SSL context
                         timeout=30
                     )
                     log.info("✅ Render PostgreSQL connection established")
@@ -250,6 +261,7 @@ class Database:
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID"""
         async with db_lock:
+            # For PostgreSQL with pg8000, we need to use different parameter style
             result = await self.fetchrow('''
                 INSERT INTO files
                 (file_id, file_name, mime_type, is_video, file_size, access_count)
@@ -262,6 +274,7 @@ class Database:
                 1 if file_info.get('is_video', False) else 0,
                 file_info.get('size', 0)
             ))
+            # Commit is handled by execute_and_commit
             await self.get_connection().commit()
             new_id = str(result[0])
             log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
@@ -388,36 +401,35 @@ class Database:
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        async with self.get_connection():
-            # Check if user exists
-            exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
+        # Check if user exists
+        exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
+        
+        if exists:
+            # Update existing user
+            await self.execute_and_commit('''
+                UPDATE users 
+                SET last_active = CURRENT_TIMESTAMP,
+                    total_interactions = total_interactions + 1,
+                    username = COALESCE($1, username),
+                    first_name = COALESCE($2, first_name),
+                    last_name = COALESCE($3, last_name)
+                WHERE user_id = $4
+            ''', (username, first_name, last_name, user_id))
             
-            if exists:
-                # Update existing user
+            if file_accessed:
                 await self.execute_and_commit('''
                     UPDATE users 
-                    SET last_active = CURRENT_TIMESTAMP,
-                        total_interactions = total_interactions + 1,
-                        username = COALESCE($1, username),
-                        first_name = COALESCE($2, first_name),
-                        last_name = COALESCE($3, last_name)
-                    WHERE user_id = $4
-                ''', (username, first_name, last_name, user_id))
-                
-                if file_accessed:
-                    await self.execute_and_commit('''
-                        UPDATE users 
-                        SET total_files_accessed = total_files_accessed + 1,
-                            last_file_accessed = CURRENT_TIMESTAMP
-                        WHERE user_id = $1
-                    ''', (user_id,))
-            else:
-                # Insert new user
-                await self.execute_and_commit('''
-                    INSERT INTO users 
-                    (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
-                ''', (user_id, username, first_name, last_name))
+                    SET total_files_accessed = total_files_accessed + 1,
+                        last_file_accessed = CURRENT_TIMESTAMP
+                    WHERE user_id = $1
+                ''', (user_id,))
+        else:
+            # Insert new user
+            await self.execute_and_commit('''
+                INSERT INTO users 
+                (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+            ''', (user_id, username, first_name, last_name))
     
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
