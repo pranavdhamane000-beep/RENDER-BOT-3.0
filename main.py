@@ -80,71 +80,134 @@ log = logging.getLogger(__name__)
 
 # ================= DATABASE (Render PostgreSQL with pg8000) =================
 
-# ================= DATABASE (Render PostgreSQL with pg8000) =================
-
 class Database:
     def __init__(self, db_url: str = DATABASE_URL):
         self.db_url = db_url
         self.connection = None
         self.connection_lock = asyncio.Lock()
+        self.connection_params = self.parse_db_url(db_url)
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
+        log.info(f"📊 Database name from URL: {self.connection_params['database']}")
+    
+    def parse_db_url(self, db_url):
+        """Parse DATABASE_URL and return connection parameters"""
+        try:
+            # Remove postgresql:// prefix
+            db_string = db_url.replace("postgresql://", "").replace("postgres://", "")
+            
+            # Split user:password@host:port/database
+            user_pass, host_port_db = db_string.split("@", 1)
+            user, password = user_pass.split(":", 1)
+            
+            # Split host:port/database
+            if "/" in host_port_db:
+                host_port, database = host_port_db.split("/", 1)
+            else:
+                host_port = host_port_db
+                database = "postgres"
+            
+            # Split host:port
+            if ":" in host_port:
+                host, port = host_port.split(":", 1)
+                port = int(port)
+            else:
+                host = host_port
+                port = 5432
+            
+            # URL decode password
+            password = urllib.parse.unquote(password)
+            
+            return {
+                'user': user,
+                'password': password,
+                'host': host,
+                'port': port,
+                'database': database
+            }
+        except Exception as e:
+            log.error(f"Failed to parse DATABASE_URL: {e}")
+            log.error(f"DATABASE_URL: {db_url}")
+            raise
     
     def create_ssl_context(self):
         """Create SSL context that accepts self-signed certificates"""
-        import ssl
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
         return ssl_context
     
+    async def connect_to_db(self, database=None):
+        """Connect to a specific database"""
+        params = self.connection_params.copy()
+        if database:
+            params['database'] = database
+        
+        ssl_context = self.create_ssl_context()
+        
+        log.info(f"🔌 Attempting to connect to {params['host']}:{params['port']}/{params['database']}")
+        
+        return await asyncio.to_thread(
+            pg8000.connect,
+            user=params['user'],
+            password=params['password'],
+            host=params['host'],
+            port=params['port'],
+            database=params['database'],
+            ssl_context=ssl_context,
+            timeout=30
+        )
+    
+    async def ensure_database_exists(self):
+        """Ensure the target database exists, create if it doesn't"""
+        target_db = self.connection_params['database']
+        
+        try:
+            # Try connecting to the target database first
+            try:
+                conn = await self.connect_to_db(target_db)
+                conn.close()
+                log.info(f"✅ Database '{target_db}' exists and is accessible")
+                return True
+            except Exception as e:
+                error_str = str(e)
+                if 'database "' + target_db + '" does not exist' in error_str:
+                    log.info(f"📁 Database '{target_db}' does not exist. Attempting to create it...")
+                else:
+                    log.error(f"❌ Error connecting to database: {e}")
+                    raise
+            
+            # Connect to default 'postgres' database to create the target database
+            conn = await self.connect_to_db('postgres')
+            
+            # Create the database
+            cursor = conn.cursor()
+            conn.autocommit = True
+            cursor.execute(f'CREATE DATABASE "{target_db}"')
+            conn.close()
+            
+            log.info(f"✅ Database '{target_db}' created successfully")
+            
+            # Verify we can connect to the new database
+            test_conn = await self.connect_to_db(target_db)
+            test_conn.close()
+            
+            return True
+            
+        except Exception as e:
+            log.error(f"❌ Error ensuring database exists: {e}")
+            return False
+    
     async def get_connection(self):
         """Get or create database connection"""
         async with self.connection_lock:
             if self.connection is None:
-                # Parse DATABASE_URL
-                # Format: postgresql://user:password@host:port/database
-                
-                # Remove postgresql:// prefix
-                db_string = self.db_url.replace("postgresql://", "").replace("postgres://", "")
-                
-                # Split user:password@host:port/database
-                user_pass, host_port_db = db_string.split("@", 1)
-                user, password = user_pass.split(":", 1)
-                
-                # Split host:port/database
-                if "/" in host_port_db:
-                    host_port, database = host_port_db.split("/", 1)
-                else:
-                    host_port = host_port_db
-                    database = "postgres"
-                
-                # Split host:port
-                if ":" in host_port:
-                    host, port = host_port.split(":", 1)
-                    port = int(port)
-                else:
-                    host = host_port
-                    port = 5432
-                
-                # URL decode password
-                password = urllib.parse.unquote(password)
-                
-                log.info(f"🔌 Connecting to Render PostgreSQL at {host}:{port}/{database}")
-                
                 try:
-                    # Create SSL context that accepts self-signed certificates
-                    ssl_context = self.create_ssl_context()
+                    # Ensure database exists
+                    await self.ensure_database_exists()
                     
-                    # Create connection with custom SSL context
-                    self.connection = pg8000.connect(
-                        user=user,
-                        password=password,
-                        host=host,
-                        port=port,
-                        database=database,
-                        ssl_context=ssl_context,  # Use custom SSL context instead of True
-                        timeout=30
-                    )
+                    # Create connection to target database
+                    self.connection = await self.connect_to_db()
+                    
                     log.info("✅ Render PostgreSQL connection established")
                     
                     # Initialize tables
@@ -157,7 +220,8 @@ class Database:
                 except Exception as e:
                     log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
                     log.error(f"💡 Check your DATABASE_URL environment variable")
-                    log.error(f"💡 Make sure the database exists and SSL is properly configured")
+                    log.error(f"💡 Current DATABASE_URL: {self.db_url}")
+                    log.error(f"💡 Parsed database name: {self.connection_params['database']}")
                     raise
             
             return self.connection
@@ -403,36 +467,35 @@ class Database:
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        async with self.get_connection():
-            # Check if user exists
-            exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
+        # Check if user exists
+        exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
+        
+        if exists:
+            # Update existing user
+            await self.execute_and_commit('''
+                UPDATE users 
+                SET last_active = CURRENT_TIMESTAMP,
+                    total_interactions = total_interactions + 1,
+                    username = COALESCE($1, username),
+                    first_name = COALESCE($2, first_name),
+                    last_name = COALESCE($3, last_name)
+                WHERE user_id = $4
+            ''', (username, first_name, last_name, user_id))
             
-            if exists:
-                # Update existing user
+            if file_accessed:
                 await self.execute_and_commit('''
                     UPDATE users 
-                    SET last_active = CURRENT_TIMESTAMP,
-                        total_interactions = total_interactions + 1,
-                        username = COALESCE($1, username),
-                        first_name = COALESCE($2, first_name),
-                        last_name = COALESCE($3, last_name)
-                    WHERE user_id = $4
-                ''', (username, first_name, last_name, user_id))
-                
-                if file_accessed:
-                    await self.execute_and_commit('''
-                        UPDATE users 
-                        SET total_files_accessed = total_files_accessed + 1,
-                            last_file_accessed = CURRENT_TIMESTAMP
-                        WHERE user_id = $1
-                    ''', (user_id,))
-            else:
-                # Insert new user
-                await self.execute_and_commit('''
-                    INSERT INTO users 
-                    (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
-                ''', (user_id, username, first_name, last_name))
+                    SET total_files_accessed = total_files_accessed + 1,
+                        last_file_accessed = CURRENT_TIMESTAMP
+                    WHERE user_id = $1
+                ''', (user_id,))
+        else:
+            # Insert new user
+            await self.execute_and_commit('''
+                INSERT INTO users 
+                (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+            ''', (user_id, username, first_name, last_name))
     
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
@@ -1415,5 +1478,4 @@ def main():
             pass
 
 if __name__ == "__main__":
-    main()  
-
+    main()
