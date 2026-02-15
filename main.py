@@ -62,7 +62,6 @@ if not RENDER_EXTERNAL_URL:
 
 WEBHOOK_PATH = "/telegram-webhook"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
-PORT = int(os.environ.get('PORT', 10000))
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
@@ -1026,16 +1025,9 @@ def health():
 def ping():
     return "pong", 200
 
-@app.route('/telegram-webhook', methods=['POST'])
-def webhook():
-    """This endpoint receives updates from Telegram"""
-    # The PTB webhook server runs separately, so this Flask endpoint won't be used
-    # PTB's built-in webhook server handles the updates
-    return "OK", 200
-
 def run_flask_thread():
     """Run Flask server in a thread"""
-    port = int(os.environ.get('FLASK_PORT', 5000))
+    port = int(os.environ.get("PORT", 5000))
     
     import warnings
     warnings.filterwarnings("ignore")
@@ -1594,8 +1586,7 @@ async def start_bot():
     await application.initialize()
     await application.start()
 
-    # SET WEBHOOK (Telegram → Render → Flask)
-    WEBHOOK_URL = "https://render-bot-3-0.onrender.com/telegram-webhook"
+    # SET WEBHOOK (Telegram → Render → Flask
     await application.bot.set_webhook(WEBHOOK_URL)
 
     log.info("✅ Webhook set successfully")
@@ -1613,7 +1604,6 @@ def main():
     print(f"✅ Webhook URL: {WEBHOOK_URL}")
     print(f"✅ Webhook Path: {WEBHOOK_PATH}")
     print(f"✅ Flask Port: 5000 (dashboard)")
-    print(f"✅ Bot Port: {PORT} (webhook)")
     print("=" * 60 + "\n")
     
     # Start Flask dashboard in a separate thread (on port 5000)
