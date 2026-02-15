@@ -25,7 +25,7 @@ app = Flask(__name__)
 start_time = time.time()
 bot_username = "xoticcroissant_bot"  # Update this to your bot username
 db_initialized = False  # Flag to track DB initialization
-
+application = None 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -816,11 +816,12 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
     return result
 
 # ============ FLASK ROUTES WITH SYNCHRONOUS DB ACCESS ============
+# ============ FLASK ROUTES WITH SYNCHRONOUS DB ACCESS ============
+
 def get_db_stats_sync():
     """Get database stats synchronously for Flask routes"""
     global db_initialized
     
-    # If DB not initialized yet, return zeros
     if not db_initialized:
         return 0, 0
         
@@ -830,8 +831,7 @@ def get_db_stats_sync():
             return 0, 0
         
         cursor = conn.cursor()
-        
-        # Check if tables exist
+
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -839,7 +839,7 @@ def get_db_stats_sync():
             )
         """)
         files_exists = cursor.fetchone()[0]
-        
+
         if not files_exists:
             conn.close()
             return 0, 0
@@ -852,12 +852,41 @@ def get_db_stats_sync():
         
         conn.close()
         return file_count, user_count
+
     except Exception as e:
         log.error(f"Error getting sync stats: {e}")
         return 0, 0
 
+
+# ✅ WEBHOOK ROUTE (OUTSIDE the function)
+from flask import request
+from telegram import Update
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    global application
+
+    if application is None:
+        return "bot not ready", 503
+
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
+
+        return "ok"
+
+    except Exception as e:
+        print("Webhook error:", e)
+        return "error", 500
+
+
 @app.route('/')
 def home():
+
     html_content = """
     <!DOCTYPE html>
 <html>
@@ -1522,32 +1551,26 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ BOT STARTUP WITH WEBHOOK ============
 async def start_bot():
-    """Start the bot with webhook"""
-    global db_initialized, bot_username
-    
+    """Start the bot with Flask webhook"""
+    global db_initialized, bot_username, application
+
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
-    
+
     # Initialize database
     await db.get_connection()
     db_initialized = True
     log.info("✅ Database fully initialized and ready")
-    
-    # Get bot info to confirm username
+
+    # Create application (GLOBAL)
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Get bot info
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username
     log.info(f"✅ Bot username: @{bot_username}")
-    
-    # Add job queue for cleanup
-    if application.job_queue:
-        application.job_queue.run_repeating(
-            cleanup_overdue_messages,
-            interval=300,
-            first=10
-        )
-    
+
     # Add handlers
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
@@ -1559,41 +1582,27 @@ async def start_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
-    
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
-    
+
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
-    
-    # Set webhook
-    success = await application.bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
-    if success:
-        log.info(f"✅ Webhook set to {WEBHOOK_URL}")
-    else:
-        log.error("❌ Failed to set webhook")
-        return
-    
-    log.info("🤖 Bot started successfully with webhook")
-    log.info(f"📁 Files in database: {await db.get_file_count()}")
-    log.info(f"👥 Users in database: {await db.get_user_count()}")
-    
-    # Start webhook server - this will block
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=WEBHOOK_URL,
-        allowed_updates=Update.ALL_TYPES,
-        secret_token=None,  # Optional: add a secret token for security
-        drop_pending_updates=True
-    )
+
+    # START BOT (no polling, no telegram server)
+    await application.initialize()
+    await application.start()
+
+    # SET WEBHOOK (Telegram → Render → Flask)
+    WEBHOOK_URL = "https://render-bot-3-0.onrender.com/telegram-webhook"
+    await application.bot.set_webhook(WEBHOOK_URL)
+
+    log.info("✅ Webhook set successfully")
+    log.info("🤖 Bot running with Flask webhook")
+
+    # keep running forever
+    await asyncio.Event().wait()
 
 def main():
     """Main function - runs both Flask and Bot"""
