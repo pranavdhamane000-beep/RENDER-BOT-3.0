@@ -22,6 +22,7 @@ app = Flask(__name__)
 # Global variables for web dashboard
 start_time = time.time()
 bot_username = "xoticcroissant_bot"
+db_initialized = False  # Flag to track DB initialization
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -87,6 +88,7 @@ class Database:
         self.connection_lock = threading.Lock()
         self.connection_params = self.parse_db_url(db_url)
         self._loop = None
+        self.initialized = False
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
         log.info(f"📊 Database name from URL: {self.connection_params['database']}")
     
@@ -225,6 +227,7 @@ class Database:
                     # Get file count
                     count = await self.get_file_count()
                     log.info(f"📊 Database initialized with {count} existing files")
+                    self.initialized = True
                     
                 except Exception as e:
                     log.error(f"❌ Failed to connect to Render PostgreSQL: {e}")
@@ -240,12 +243,17 @@ class Database:
         conn = await self.get_connection()
         
         def _execute():
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            return cursor
+            try:
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                return cursor
+            except Exception as e:
+                log.error(f"Error executing query: {e}")
+                log.error(f"Query: {query[:200]}")
+                raise
         
         return await asyncio.to_thread(_execute)
     
@@ -286,6 +294,7 @@ class Database:
                     access_count INTEGER DEFAULT 0
                 )
             ''')
+            log.info("✅ Created/verified files table")
             
             # Membership cache
             await self.execute_and_commit('''
@@ -297,6 +306,7 @@ class Database:
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
+            log.info("✅ Created/verified membership_cache table")
             
             # Scheduled deletions
             await self.execute_and_commit('''
@@ -308,6 +318,7 @@ class Database:
                     PRIMARY KEY (chat_id, message_id)
                 )
             ''')
+            log.info("✅ Created/verified scheduled_deletions table")
             
             # Users table
             await self.execute_and_commit('''
@@ -323,6 +334,7 @@ class Database:
                     last_file_accessed TIMESTAMP
                 )
             ''')
+            log.info("✅ Created/verified users table")
             
             # Indexes
             await self.execute_and_commit('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
@@ -330,6 +342,7 @@ class Database:
             await self.execute_and_commit('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
             await self.execute_and_commit('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
             await self.execute_and_commit('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
+            log.info("✅ Created/verified indexes")
             
         except Exception as e:
             log.error(f"Error initializing database: {e}")
@@ -388,8 +401,12 @@ class Database:
     
     async def get_file_count(self) -> int:
         """Get total number of files"""
-        result = await self.fetchrow("SELECT COUNT(*) FROM files")
-        return result[0] if result else 0
+        try:
+            result = await self.fetchrow("SELECT COUNT(*) FROM files")
+            return result[0] if result else 0
+        except Exception as e:
+            log.error(f"Error getting file count: {e}")
+            return 0
     
     async def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result"""
@@ -509,108 +526,138 @@ class Database:
     
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
-        # Total users
-        total_users = await self.fetchrow("SELECT COUNT(*) FROM users")
-        total_users = total_users[0] if total_users else 0
-        
-        # Active users (last 7 days)
-        active_7d = await self.fetchrow('''
-            SELECT COUNT(*) FROM users 
-            WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
-        ''')
-        active_users_7d = active_7d[0] if active_7d else 0
-        
-        # Active users (last 30 days)
-        active_30d = await self.fetchrow('''
-            SELECT COUNT(*) FROM users 
-            WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
-        ''')
-        active_users_30d = active_30d[0] if active_30d else 0
-        
-        # New users today
-        new_today = await self.fetchrow('''
-            SELECT COUNT(*) FROM users 
-            WHERE DATE(first_seen) = CURRENT_DATE
-        ''')
-        new_users_today = new_today[0] if new_today else 0
-        
-        # New users this week
-        new_week = await self.fetchrow('''
-            SELECT COUNT(*) FROM users 
-            WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
-        ''')
-        new_users_week = new_week[0] if new_week else 0
-        
-        # Top 10 users
-        top_rows = await self.fetchall('''
-            SELECT user_id, username, first_name, last_name, 
-                   total_interactions, total_files_accessed,
-                   TO_CHAR(last_active, 'YYYY-MM-DD HH24:MI:SS') as last_active,
-                   TO_CHAR(first_seen, 'YYYY-MM-DD HH24:MI:SS') as first_seen
-            FROM users 
-            ORDER BY total_interactions DESC 
-            LIMIT 10
-        ''')
-        top_users = [(
-            row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
-        ) for row in top_rows]
-        
-        # Users who accessed files
-        users_files = await self.fetchrow('''
-            SELECT COUNT(DISTINCT user_id) FROM users 
-            WHERE total_files_accessed > 0
-        ''')
-        users_with_files = users_files[0] if users_files else 0
-        
-        # Growth data
-        growth_rows = await self.fetchall('''
-            SELECT 
-                TO_CHAR(first_seen, 'YYYY-MM-DD') as date,
-                COUNT(*) as new_users
-            FROM users
-            WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '30 days'
-            GROUP BY date
-            ORDER BY date DESC
-            LIMIT 15
-        ''')
-        growth_data = [(row[0], row[1]) for row in growth_rows]
-        
-        return {
-            'total_users': total_users,
-            'active_users_7d': active_users_7d,
-            'active_users_30d': active_users_30d,
-            'new_users_today': new_users_today,
-            'new_users_week': new_users_week,
-            'top_users': top_users,
-            'users_with_files': users_with_files,
-            'growth_data': growth_data
-        }
+        try:
+            # Total users
+            total_users = await self.fetchrow("SELECT COUNT(*) FROM users")
+            total_users = total_users[0] if total_users else 0
+            
+            # Active users (last 7 days)
+            active_7d = await self.fetchrow('''
+                SELECT COUNT(*) FROM users 
+                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '7 days'
+            ''')
+            active_users_7d = active_7d[0] if active_7d else 0
+            
+            # Active users (last 30 days)
+            active_30d = await self.fetchrow('''
+                SELECT COUNT(*) FROM users 
+                WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '30 days'
+            ''')
+            active_users_30d = active_30d[0] if active_30d else 0
+            
+            # New users today
+            new_today = await self.fetchrow('''
+                SELECT COUNT(*) FROM users 
+                WHERE DATE(first_seen) = CURRENT_DATE
+            ''')
+            new_users_today = new_today[0] if new_today else 0
+            
+            # New users this week
+            new_week = await self.fetchrow('''
+                SELECT COUNT(*) FROM users 
+                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '7 days'
+            ''')
+            new_users_week = new_week[0] if new_week else 0
+            
+            # Top 10 users
+            top_rows = await self.fetchall('''
+                SELECT user_id, username, first_name, last_name, 
+                       total_interactions, total_files_accessed,
+                       TO_CHAR(last_active, 'YYYY-MM-DD HH24:MI:SS') as last_active,
+                       TO_CHAR(first_seen, 'YYYY-MM-DD HH24:MI:SS') as first_seen
+                FROM users 
+                ORDER BY total_interactions DESC 
+                LIMIT 10
+            ''')
+            top_users = [(
+                row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+            ) for row in top_rows]
+            
+            # Users who accessed files
+            users_files = await self.fetchrow('''
+                SELECT COUNT(DISTINCT user_id) FROM users 
+                WHERE total_files_accessed > 0
+            ''')
+            users_with_files = users_files[0] if users_files else 0
+            
+            # Growth data
+            growth_rows = await self.fetchall('''
+                SELECT 
+                    TO_CHAR(first_seen, 'YYYY-MM-DD') as date,
+                    COUNT(*) as new_users
+                FROM users
+                WHERE first_seen > CURRENT_TIMESTAMP - INTERVAL '30 days'
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT 15
+            ''')
+            growth_data = [(row[0], row[1]) for row in growth_rows]
+            
+            return {
+                'total_users': total_users,
+                'active_users_7d': active_users_7d,
+                'active_users_30d': active_users_30d,
+                'new_users_today': new_users_today,
+                'new_users_week': new_users_week,
+                'top_users': top_users,
+                'users_with_files': users_with_files,
+                'growth_data': growth_data
+            }
+        except Exception as e:
+            log.error(f"Error getting user stats: {e}")
+            return {
+                'total_users': 0,
+                'active_users_7d': 0,
+                'active_users_30d': 0,
+                'new_users_today': 0,
+                'new_users_week': 0,
+                'top_users': [],
+                'users_with_files': 0,
+                'growth_data': []
+            }
     
     async def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
         """Get all user IDs for broadcasting"""
-        if exclude_admin:
-            rows = await self.fetchall("SELECT user_id FROM users WHERE user_id != $1", (ADMIN_ID,))
-        else:
-            rows = await self.fetchall("SELECT user_id FROM users")
-        return [row[0] for row in rows]
+        try:
+            if exclude_admin:
+                rows = await self.fetchall("SELECT user_id FROM users WHERE user_id != $1", (ADMIN_ID,))
+            else:
+                rows = await self.fetchall("SELECT user_id FROM users")
+            return [row[0] for row in rows]
+        except Exception as e:
+            log.error(f"Error getting user IDs: {e}")
+            return []
     
     async def get_user_count(self) -> int:
         """Get total number of users"""
-        result = await self.fetchrow("SELECT COUNT(*) FROM users")
-        return result[0] if result else 0
+        try:
+            result = await self.fetchrow("SELECT COUNT(*) FROM users")
+            return result[0] if result else 0
+        except Exception as e:
+            log.error(f"Error getting user count: {e}")
+            return 0
     
     def get_sync_connection(self):
         """Get a synchronous connection for Flask routes"""
+        global db_initialized
         try:
-            # Ensure database exists (synchronous)
-            self.ensure_database_exists_sync()
-            
-            # Create connection
+            # If DB not initialized yet, return None (will show 0 counts)
+            if not db_initialized:
+                return None
+                
             conn = self.connect_to_db_sync()
             return conn
         except Exception as e:
             log.error(f"Failed to create sync connection: {e}")
             return None
+    
+    async def wait_for_initialization(self):
+        """Wait for database initialization"""
+        timeout = 30  # 30 seconds timeout
+        start = time.time()
+        while not self.initialized and time.time() - start < timeout:
+            await asyncio.sleep(1)
+        return self.initialized
     
     async def close(self):
         """Close database connection"""
@@ -758,12 +805,32 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
 # ============ FLASK ROUTES WITH SYNCHRONOUS DB ACCESS ============
 def get_db_stats_sync():
     """Get database stats synchronously for Flask routes"""
+    global db_initialized
+    
+    # If DB not initialized yet, return zeros
+    if not db_initialized:
+        return 0, 0
+        
     try:
         conn = db.get_sync_connection()
         if not conn:
             return 0, 0
         
         cursor = conn.cursor()
+        
+        # Check if tables exist
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'files'
+            )
+        """)
+        files_exists = cursor.fetchone()[0]
+        
+        if not files_exists:
+            conn.close()
+            return 0, 0
+            
         cursor.execute("SELECT COUNT(*) FROM files")
         file_count = cursor.fetchone()[0]
         
@@ -905,7 +972,8 @@ def health():
         "database": "postgresql",
         "storage": "permanent",
         "file_count": file_count,
-        "user_count": user_count
+        "user_count": user_count,
+        "db_initialized": db_initialized
     }), 200
 
 @app.route('/ping')
@@ -1430,12 +1498,16 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 async def start_bot():
     """Start the bot"""
+    global db_initialized
+    
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
     
     # Initialize database
     await db.get_connection()
+    db_initialized = True
+    log.info("✅ Database fully initialized and ready")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
