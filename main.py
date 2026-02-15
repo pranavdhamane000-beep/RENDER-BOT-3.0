@@ -1555,7 +1555,6 @@ async def start_bot():
     log.info("✅ Database fully initialized and ready")
 
     # Create application (GLOBAL)
-    global application
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Get bot info
@@ -1579,27 +1578,29 @@ async def start_bot():
 
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
-        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
+        MessageHandler(
+            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+            upload
+        )
     )
 
-    # START BOT (no polling, no telegram server)
-  await application.initialize()
+    # Initialize application
+    await application.initialize()
 
-# delete old webhook first
-await application.bot.delete_webhook(drop_pending_updates=True)
+    # Remove old webhook
+    await application.bot.delete_webhook(drop_pending_updates=True)
 
-# set new webhook
-await application.bot.set_webhook(url=WEBHOOK_URL)
+    # Set new webhook
+    await application.bot.set_webhook(url=WEBHOOK_URL)
+    log.info(f"✅ Webhook set to: {WEBHOOK_URL}")
 
-print("✅ Webhook set to:", WEBHOOK_URL)
+    # Start application (NO polling)
+    await application.start()
 
-await application.start()
-
-
-    log.info("✅ Webhook set successfully")
     log.info("🤖 Bot running with Flask webhook")
 
-    # keep running forever
+    # Keep running forever
+    await asyncio.Event().wait()
 
 def main():
     """Main function - runs both Flask and Bot"""
