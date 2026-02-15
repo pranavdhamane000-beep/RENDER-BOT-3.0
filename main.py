@@ -17,11 +17,13 @@ import functools
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
+import threading
+
 app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xoticcroissant_bot"
+bot_username = "xoticcroissant_bot"  # Update this to your bot username
 db_initialized = False  # Flag to track DB initialization
 
 # ===========================================================
@@ -44,12 +46,23 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
-# ============ 🔥 RENDER POSTGRESQL - 100% PERSISTENT, FREE, NO COMPILATION! 🔥 ============
+# ============ 🔥 RENDER POSTGRESQL - 100% PERSISTENT ============
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
     print("❌ ERROR: DATABASE_URL is not set!")
     print("💡 Add a PostgreSQL database in Render Dashboard and copy its Internal Database URL")
     raise ValueError("DATABASE_URL environment variable is required!")
+
+# ============ 🔥 WEBHOOK CONFIGURATION ============
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip('/')
+if not RENDER_EXTERNAL_URL:
+    print("❌ ERROR: RENDER_EXTERNAL_URL is not set!")
+    print("💡 Set it to your Render app URL (e.g., https://your-app.onrender.com)")
+    raise ValueError("RENDER_EXTERNAL_URL environment variable is required!")
+
+WEBHOOK_PATH = "/telegram-webhook"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+PORT = int(os.environ.get('PORT', 10000))
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
@@ -918,11 +931,12 @@ def home():
         <h1>🤖 Telegram File Bot</h1>
         <div class="status">
             <h3>✅ Status: <strong>ACTIVE</strong></h3>
-            <p>Bot is running on Render with PostgreSQL</p>
+            <p>Bot is running on Render with PostgreSQL (Webhook Mode)</p>
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
             <p>📁 Storage: PERMANENT PostgreSQL</p>
+            <p>🔗 Webhook URL: {{ webhook_url }}</p>
         </div>
         
         <div class="info">
@@ -958,7 +972,8 @@ def home():
                                   user_count=user_count,
                                   channel1=CHANNEL_1,
                                   channel2=CHANNEL_2,
-                                  delete_minutes=DELETE_AFTER//60)
+                                  delete_minutes=DELETE_AFTER//60,
+                                  webhook_url=WEBHOOK_URL)
 
 @app.route('/health')
 def health():
@@ -971,6 +986,8 @@ def health():
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "database": "postgresql",
         "storage": "permanent",
+        "mode": "webhook",
+        "webhook_url": WEBHOOK_URL,
         "file_count": file_count,
         "user_count": user_count,
         "db_initialized": db_initialized
@@ -980,9 +997,16 @@ def health():
 def ping():
     return "pong", 200
 
+@app.route('/telegram-webhook', methods=['POST'])
+def webhook():
+    """This endpoint receives updates from Telegram"""
+    # The PTB webhook server runs separately, so this Flask endpoint won't be used
+    # PTB's built-in webhook server handles the updates
+    return "OK", 200
+
 def run_flask_thread():
     """Run Flask server in a thread"""
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('FLASK_PORT', 5000))
     
     import warnings
     warnings.filterwarnings("ignore")
@@ -991,6 +1015,7 @@ def run_flask_thread():
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
     flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
     
+    # Run Flask on a different port than the webhook
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ COMMAND HANDLERS ============
@@ -1495,10 +1520,10 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ MAIN ============
+# ============ BOT STARTUP WITH WEBHOOK ============
 async def start_bot():
-    """Start the bot"""
-    global db_initialized
+    """Start the bot with webhook"""
+    global db_initialized, bot_username
     
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
@@ -1509,8 +1534,11 @@ async def start_bot():
     db_initialized = True
     log.info("✅ Database fully initialized and ready")
     
-    # Create application
+    # Get bot info to confirm username
     application = Application.builder().token(BOT_TOKEN).build()
+    bot_info = await application.bot.get_me()
+    bot_username = bot_info.username
+    log.info(f"✅ Bot username: @{bot_username}")
     
     # Add job queue for cleanup
     if application.job_queue:
@@ -1540,28 +1568,51 @@ async def start_bot():
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
     
-    log.info("🤖 Bot started successfully")
+    # Set webhook
+    success = await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+    if success:
+        log.info(f"✅ Webhook set to {WEBHOOK_URL}")
+    else:
+        log.error("❌ Failed to set webhook")
+        return
+    
+    log.info("🤖 Bot started successfully with webhook")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
     
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start webhook server - this will block
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
+        secret_token=None,  # Optional: add a secret token for security
+        drop_pending_updates=True
+    )
 
 def main():
-    """Main function"""
+    """Main function - runs both Flask and Bot"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + pg8000")
+    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + WEBHOOK")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
-    print(f"✅ Admin: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL (PERMANENT)")
-    print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
+    print(f"✅ Webhook URL: {WEBHOOK_URL}")
+    print(f"✅ Webhook Path: {WEBHOOK_PATH}")
+    print(f"✅ Flask Port: 5000 (dashboard)")
+    print(f"✅ Bot Port: {PORT} (webhook)")
     print("=" * 60 + "\n")
     
-    # Start Flask
+    # Start Flask dashboard in a separate thread (on port 5000)
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
+    log.info(f"✅ Flask dashboard started on port 5000")
     
-    # Start bot
+    # Start bot with webhook (this blocks)
     try:
         asyncio.run(start_bot())
     except KeyboardInterrupt:
