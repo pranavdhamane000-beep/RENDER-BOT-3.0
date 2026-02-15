@@ -13,8 +13,7 @@ import threading
 import pg8000
 from contextlib import asynccontextmanager
 import urllib.parse
-
-db_lock = asyncio.Lock()
+import functools
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
@@ -84,8 +83,10 @@ class Database:
     def __init__(self, db_url: str = DATABASE_URL):
         self.db_url = db_url
         self.connection = None
-        self.connection_lock = asyncio.Lock()
+        # Use threading.Lock instead of asyncio.Lock to avoid event loop issues
+        self.connection_lock = threading.Lock()
         self.connection_params = self.parse_db_url(db_url)
+        self._loop = None
         log.info(f"📀 Connecting to Render PostgreSQL with pg8000...")
         log.info(f"📊 Database name from URL: {self.connection_params['database']}")
     
@@ -136,8 +137,8 @@ class Database:
         ssl_context.verify_mode = ssl.CERT_NONE
         return ssl_context
     
-    async def connect_to_db(self, database=None):
-        """Connect to a specific database"""
+    def connect_to_db_sync(self, database=None):
+        """Synchronous connection to database"""
         params = self.connection_params.copy()
         if database:
             params['database'] = database
@@ -146,8 +147,7 @@ class Database:
         
         log.info(f"🔌 Attempting to connect to {params['host']}:{params['port']}/{params['database']}")
         
-        return await asyncio.to_thread(
-            pg8000.connect,
+        return pg8000.connect(
             user=params['user'],
             password=params['password'],
             host=params['host'],
@@ -157,14 +157,18 @@ class Database:
             timeout=30
         )
     
-    async def ensure_database_exists(self):
-        """Ensure the target database exists, create if it doesn't"""
+    async def connect_to_db(self, database=None):
+        """Async wrapper for database connection"""
+        return await asyncio.to_thread(self.connect_to_db_sync, database)
+    
+    def ensure_database_exists_sync(self):
+        """Synchronous version of ensure_database_exists"""
         target_db = self.connection_params['database']
         
         try:
             # Try connecting to the target database first
             try:
-                conn = await self.connect_to_db(target_db)
+                conn = self.connect_to_db_sync(target_db)
                 conn.close()
                 log.info(f"✅ Database '{target_db}' exists and is accessible")
                 return True
@@ -177,7 +181,7 @@ class Database:
                     raise
             
             # Connect to default 'postgres' database to create the target database
-            conn = await self.connect_to_db('postgres')
+            conn = self.connect_to_db_sync('postgres')
             
             # Create the database
             cursor = conn.cursor()
@@ -188,7 +192,7 @@ class Database:
             log.info(f"✅ Database '{target_db}' created successfully")
             
             # Verify we can connect to the new database
-            test_conn = await self.connect_to_db(target_db)
+            test_conn = self.connect_to_db_sync(target_db)
             test_conn.close()
             
             return True
@@ -197,9 +201,14 @@ class Database:
             log.error(f"❌ Error ensuring database exists: {e}")
             return False
     
+    async def ensure_database_exists(self):
+        """Ensure the target database exists, create if it doesn't"""
+        return await asyncio.to_thread(self.ensure_database_exists_sync)
+    
     async def get_connection(self):
         """Get or create database connection"""
-        async with self.connection_lock:
+        # Use threading.Lock instead of asyncio.Lock
+        with self.connection_lock:
             if self.connection is None:
                 try:
                     # Ensure database exists
@@ -328,23 +337,23 @@ class Database:
     
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID"""
-        async with db_lock:
-            result = await self.fetchrow('''
-                INSERT INTO files
-                (file_id, file_name, mime_type, is_video, file_size, access_count)
-                VALUES ($1, $2, $3, $4, $5, 0)
-                RETURNING id
-            ''', (
-                file_id,
-                file_info.get('file_name', ''),
-                file_info.get('mime_type', ''),
-                1 if file_info.get('is_video', False) else 0,
-                file_info.get('size', 0)
-            ))
-            await self.get_connection().commit()
-            new_id = str(result[0])
-            log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
-            return new_id
+        result = await self.fetchrow('''
+            INSERT INTO files
+            (file_id, file_name, mime_type, is_video, file_size, access_count)
+            VALUES ($1, $2, $3, $4, $5, 0)
+            RETURNING id
+        ''', (
+            file_id,
+            file_info.get('file_name', ''),
+            file_info.get('mime_type', ''),
+            1 if file_info.get('is_video', False) else 0,
+            file_info.get('size', 0)
+        ))
+        conn = await self.get_connection()
+        await asyncio.to_thread(conn.commit)
+        new_id = str(result[0])
+        log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
+        return new_id
 
     async def get_file(self, file_id: str) -> Optional[dict]:
         """Get file info by ID"""
@@ -364,7 +373,8 @@ class Database:
         ''', (file_id_int,))
         
         if result:
-            await self.get_connection().commit()
+            conn = await self.get_connection()
+            await asyncio.to_thread(conn.commit)
             return {
                 'file_id': result[0],
                 'file_name': result[1],
@@ -589,6 +599,19 @@ class Database:
         result = await self.fetchrow("SELECT COUNT(*) FROM users")
         return result[0] if result else 0
     
+    def get_sync_connection(self):
+        """Get a synchronous connection for Flask routes"""
+        try:
+            # Ensure database exists (synchronous)
+            self.ensure_database_exists_sync()
+            
+            # Create connection
+            conn = self.connect_to_db_sync()
+            return conn
+        except Exception as e:
+            log.error(f"Failed to create sync connection: {e}")
+            return None
+    
     async def close(self):
         """Close database connection"""
         if self.connection:
@@ -732,7 +755,27 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
     result["all_joined"] = result["channel1"] and result["channel2"]
     return result
 
-# ============ WEB ROUTES ============
+# ============ FLASK ROUTES WITH SYNCHRONOUS DB ACCESS ============
+def get_db_stats_sync():
+    """Get database stats synchronously for Flask routes"""
+    try:
+        conn = db.get_sync_connection()
+        if not conn:
+            return 0, 0
+        
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM files")
+        file_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM users")
+        user_count = cursor.fetchone()[0]
+        
+        conn.close()
+        return file_count, user_count
+    except Exception as e:
+        log.error(f"Error getting sync stats: {e}")
+        return 0, 0
+
 @app.route('/')
 def home():
     html_content = """
@@ -837,17 +880,8 @@ def home():
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
     
-    # Run async function in sync context
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        file_count = loop.run_until_complete(db.get_file_count())
-        user_count = loop.run_until_complete(db.get_user_count())
-    except:
-        file_count = 0
-        user_count = 0
-    finally:
-        loop.close()
+    # Use synchronous database access
+    file_count, user_count = get_db_stats_sync()
     
     return render_template_string(html_content, 
                                   bot_username=bot_username,
@@ -861,16 +895,7 @@ def home():
 
 @app.route('/health')
 def health():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        file_count = loop.run_until_complete(db.get_file_count())
-        user_count = loop.run_until_complete(db.get_user_count())
-    except:
-        file_count = 0
-        user_count = 0
-    finally:
-        loop.close()
+    file_count, user_count = get_db_stats_sync()
     
     return jsonify({
         "status": "OK",
@@ -1388,7 +1413,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    result = await db.execute_and_commit('''
+    await db.execute_and_commit('''
         DELETE FROM files 
         WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
     ''', (days,))
