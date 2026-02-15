@@ -1037,7 +1037,6 @@ def run_flask_thread():
     flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
     
     # Run Flask on a different port than the webhook
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ COMMAND HANDLERS ============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1556,6 +1555,7 @@ async def start_bot():
     log.info("✅ Database fully initialized and ready")
 
     # Create application (GLOBAL)
+    global application
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Get bot info
@@ -1593,36 +1593,24 @@ async def start_bot():
     log.info("🤖 Bot running with Flask webhook")
 
     # keep running forever
-    await asyncio.Event().wait()
 
 def main():
     """Main function - runs both Flask and Bot"""
+    import asyncio
+
     print("\n" + "=" * 60)
     print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + WEBHOOK")
     print("=" * 60)
-    print(f"✅ Bot: @{bot_username}")
-    print(f"✅ Webhook URL: {WEBHOOK_URL}")
-    print(f"✅ Webhook Path: {WEBHOOK_PATH}")
-    print(f"✅ Flask Port: 5000 (dashboard)")
-    print("=" * 60 + "\n")
-    
-    # Start Flask dashboard in a separate thread (on port 5000)
-    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
-    flask_thread.start()
-    log.info(f"✅ Flask dashboard started on port 5000")
-    
-    # Start bot with webhook (this blocks)
+
+    # Start telegram bot FIRST (initialize only)
     try:
         asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped")
     except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
-    finally:
-        try:
-            asyncio.run(db.close())
-        except:
-            pass
+        log.error(f"Bot startup error: {e}")
+
+    # Start Flask dashboard + webhook server
+    run_flask_thread()   # NOT thread — run directly
+
 
 if __name__ == "__main__":
     main()
