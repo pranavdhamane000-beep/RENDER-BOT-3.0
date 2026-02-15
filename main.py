@@ -1583,11 +1583,18 @@ async def start_bot():
     )
 
     # START BOT (no polling, no telegram server)
-    await application.initialize()
-    await application.start()
+  await application.initialize()
 
-    # SET WEBHOOK (Telegram → Render → Flask
-    await application.bot.set_webhook(WEBHOOK_URL)
+# delete old webhook first
+await application.bot.delete_webhook(drop_pending_updates=True)
+
+# set new webhook
+await application.bot.set_webhook(url=WEBHOOK_URL)
+
+print("✅ Webhook set to:", WEBHOOK_URL)
+
+await application.start()
+
 
     log.info("✅ Webhook set successfully")
     log.info("🤖 Bot running with Flask webhook")
