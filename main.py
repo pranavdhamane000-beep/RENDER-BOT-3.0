@@ -1381,32 +1381,32 @@ async def start_bot():
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
-    """Main function"""
-    print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + pg8000")
-    print("=" * 60)
-    print(f"✅ Bot: @{bot_username}")
-    print(f"✅ Admin: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL (PERMANENT)")
-    print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
-    print("=" * 60 + "\n")
-    
-    # Start Flask
-    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    # Start Flask in background thread
+    flask_thread = threading.Thread(target=run_flask_thread)
+    flask_thread.daemon = True
     flask_thread.start()
-    
-    # Start bot
-    try:
-        asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped")
-    except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
-    finally:
-        try:
-            asyncio.run(db.close())
-        except:
-            pass
+
+    # Build Telegram application
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(check_join))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, upload))
+
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("listfiles", listfiles))
+    application.add_handler(CommandHandler("deletefile", deletefile))
+    application.add_handler(CommandHandler("users", users))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("clearcache", clearcache))
+    application.add_handler(CommandHandler("testchannel", testchannel))
+
+    application.add_error_handler(error_handler)
+
+    print("🚀 Bot is starting polling...")
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
