@@ -22,7 +22,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xoticcroissant_bot"
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
