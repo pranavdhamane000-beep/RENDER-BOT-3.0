@@ -25,6 +25,7 @@ bot_username = "xiomovies_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
+bot_initialized = False
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -89,13 +90,13 @@ class Database:
         self.db_url = db_url
         # Use a simple connection pool for thread safety and efficiency
         self.pool = None
+        self._pool_initialized = False
         log.info(f"📀 Connecting to Render PostgreSQL with psycopg2...")
 
-    def _get_pool(self):
-        """Lazy initialization of the connection pool."""
+    def _get_pool_sync(self):
+        """Synchronous pool initialization - called only once"""
         if self.pool is None:
             # Parse DATABASE_URL for psycopg2's DSN
-            # Format: postgresql://user:password@host:port/database
             result = urllib.parse.urlparse(self.db_url)
             user = result.username
             password = urllib.parse.unquote(result.password) if result.password else ''
@@ -107,15 +108,14 @@ class Database:
             log.info(f"🔌 Creating connection pool to Render PostgreSQL at {host}:{port}/{database}")
 
             try:
-                # Create a connection pool. minconn=1, maxconn=10 is a good start for Render.
-                # This pool is thread-safe.
+                # Create a connection pool
                 self.pool = psycopg2.pool.SimpleConnectionPool(
                     1, 20, dsn=dsn, connect_timeout=30,
-                    sslmode='require' # Enforce SSL for Render
+                    sslmode='require'
                 )
                 log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
 
-                # Initialize tables using a connection from the pool
+                # Initialize tables
                 conn = self.pool.getconn()
                 try:
                     with conn.cursor() as cur:
@@ -123,17 +123,22 @@ class Database:
                 finally:
                     self.pool.putconn(conn)
 
-                # Log file count
-                count = asyncio.run(self.get_file_count()) # Use asyncio.run carefully, or make init async.
-                log.info(f"📊 Database initialized with {count} existing files")
+                self._pool_initialized = True
+                log.info("✅ Database tables initialized/verified.")
 
             except Exception as e:
                 log.error(f"❌ Failed to create connection pool to Render PostgreSQL: {e}")
                 raise
         return self.pool
 
+    async def _get_pool_async(self):
+        """Async wrapper for pool initialization"""
+        if self.pool is None:
+            await asyncio.to_thread(self._get_pool_sync)
+        return self.pool
+
     def _init_db(self, conn, cur):
-        """Initialize database tables (synchronous, called from _get_pool)."""
+        """Initialize database tables (synchronous)"""
         cur.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id SERIAL PRIMARY KEY,
@@ -183,12 +188,11 @@ class Database:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
         conn.commit()
-        log.info("✅ Database tables initialized/verified.")
 
     @asynccontextmanager
     async def get_db_connection(self):
         """Asynchronous context manager to get and return a connection from the pool."""
-        pool = self._get_pool()
+        pool = await self._get_pool_async()
         conn = await asyncio.to_thread(pool.getconn)
         try:
             yield conn
@@ -196,8 +200,7 @@ class Database:
             await asyncio.to_thread(pool.putconn, conn)
 
     async def execute(self, query: str, params: tuple = None):
-        """Execute a query and return cursor (use with 'with' on connection)."""
-        # This is a helper; it's often better to use get_db_connection directly for transactions.
+        """Execute a query and return cursor"""
         async with self.get_db_connection() as conn:
             def _execute():
                 with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -283,7 +286,7 @@ class Database:
 
     async def get_file_count(self) -> int:
         """Get total number of files."""
-        result = await self.fetchrow("SELECT COUNT(*) FROM files")
+        result = await self.fetchrow("SELECT COUNT(*) as count FROM files")
         return result['count'] if result else 0
 
     async def cache_membership(self, user_id: int, channel: str, is_member: bool):
@@ -367,8 +370,6 @@ class Database:
         )
         log.info(f"Removed scheduled deletion for message {message_id}")
 
-    # ============ USER TRACKING FUNCTIONS ============
-
     async def update_user_interaction(self, user_id: int, username: str = None,
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
@@ -411,7 +412,6 @@ class Database:
 
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics."""
-        # Fetch all stats in parallel using asyncio.gather
         async def fetch_one(query, params=None):
             return await self.fetchrow(query, params)
 
@@ -732,14 +732,13 @@ def home():
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
-    # Run async function in sync context using asyncio.run() - careful but works for simple routes
+    # Use asyncio.run() with proper error handling
     try:
-        file_count = asyncio.run(db.get_file_count())
-        user_count = asyncio.run(db.get_user_count())
-    except RuntimeError: # Handle case where event loop is already running (e.g., from webhook)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        loop.close()
     except Exception as e:
         log.error(f"Error fetching counts for home route: {e}")
         file_count = 0
@@ -758,12 +757,11 @@ def home():
 @app.route('/health')
 def health():
     try:
-        file_count = asyncio.run(db.get_file_count())
-        user_count = asyncio.run(db.get_user_count())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        loop.close()
     except Exception as e:
         log.error(f"Error in health check: {e}")
         file_count = 0
@@ -778,7 +776,8 @@ def health():
         "driver": "psycopg2-binary",
         "storage": "permanent",
         "file_count": file_count,
-        "user_count": user_count
+        "user_count": user_count,
+        "bot_initialized": bot_initialized
     }), 200
 
 @app.route('/ping')
@@ -788,20 +787,30 @@ def ping():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle Telegram webhook updates"""
-    global bot_app, bot_loop
-    if bot_app is None or bot_loop is None:
-        log.error("Bot application or loop not initialized for webhook")
-        return "Bot not initialized", 503
+    global bot_app, bot_loop, bot_initialized
+    
+    if not bot_initialized or bot_app is None or bot_loop is None:
+        log.error("Bot application not fully initialized for webhook")
+        return "Bot not ready", 503
 
     update_data = request.get_json()
     if not update_data:
         return "Invalid request", 400
 
     # Process update in bot's event loop
-    asyncio.run_coroutine_threadsafe(
+    future = asyncio.run_coroutine_threadsafe(
         process_update(update_data, bot_app),
         bot_loop
     )
+    
+    try:
+        # Wait a bit for the update to be queued
+        future.result(timeout=1)
+    except asyncio.TimeoutError:
+        # Update is queued but not completed - that's fine
+        pass
+    except Exception as e:
+        log.error(f"Error queueing update: {e}")
 
     return "OK", 200
 
@@ -814,7 +823,7 @@ async def process_update(update_data, application):
         log.error(f"Error processing update: {e}", exc_info=True)
 
 def run_flask_thread():
-    """Run Flask server in a thread - Python 3.14+ compatible"""
+    """Run Flask server in a thread"""
     port = int(os.environ.get('PORT', 10000))
 
     import warnings
@@ -830,10 +839,6 @@ def run_flask_thread():
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ COMMAND HANDLERS ============
-# (Keep all your existing command handlers exactly as they are: start, check_join, upload, stats, listfiles, deletefile, users, broadcast, clearcache, testchannel, cleanup)
-# No changes needed in the handlers themselves. They remain async and use the db instance.
-
-# I'll include them here for completeness, but they are identical to your original code.
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
@@ -841,7 +846,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
-    # ... (your original start function code) ...
     try:
         if not update.message:
             return
@@ -957,7 +961,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle callback queries"""
-    # ... (your original check_join function code) ...
     try:
         query = update.callback_query
         await query.answer()
@@ -1083,7 +1086,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Upload file handler (admin only)"""
-    # ... (your original upload function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1144,7 +1146,6 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stats command (admin only)"""
-    # ... (your original stats function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1171,7 +1172,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List files (admin only)"""
-    # ... (your original listfiles function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1193,7 +1193,6 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete file (admin only)"""
-    # ... (your original deletefile function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1212,7 +1211,6 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User stats (admin only)"""
-    # ... (your original users function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1232,7 +1230,6 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast to users (admin only)"""
-    # ... (your original broadcast function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1284,7 +1281,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache (admin only)"""
-    # ... (your original clearcache function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1294,7 +1290,6 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test channel access (admin only)"""
-    # ... (your original testchannel function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1322,7 +1317,6 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual cleanup (admin only)"""
-    # ... (your original cleanup function code) ...
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1349,22 +1343,19 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============ MAIN ============
-async def start_bot_webhook():
-    """Initialize bot and set webhook (for Render with Python 3.14+)"""
-    global bot_app, bot_loop
+async def initialize_bot():
+    """Initialize bot application"""
+    global bot_app, bot_loop, bot_initialized
 
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return None
 
-    # Initialize database connection pool (sync part is handled in _get_pool)
-    # We just need to trigger pool creation
+    # Initialize database connection pool synchronously first
     log.info("Initializing database connection pool...")
     try:
-        # Trigger pool creation by getting a connection and releasing it
-        async with db.get_db_connection() as conn:
-            # Test connection
-            await asyncio.to_thread(conn.cursor().execute, "SELECT 1")
+        # This will run the synchronous pool initialization
+        db._get_pool_sync()
         log.info("Database pool initialized.")
     except Exception as e:
         log.error(f"Failed to initialize database: {e}", exc_info=True)
@@ -1373,7 +1364,12 @@ async def start_bot_webhook():
     # Create application with a custom request for better timeout handling
     request = HTTPXRequest(connection_pool_size=40)
     application = Application.builder().token(BOT_TOKEN).request(request).build()
+    
+    # Initialize the application
+    await application.initialize()
+    
     bot_loop = asyncio.get_running_loop()
+    bot_app = application
 
     # Add job queue for cleanup
     if application.job_queue:
@@ -1406,7 +1402,6 @@ async def start_bot_webhook():
     # Set webhook
     render_url = os.environ.get('RENDER_EXTERNAL_URL')
     if not render_url:
-        # Fallback for local dev or if env var not set
         render_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost')}"
 
     webhook_url = f"{render_url}/webhook"
@@ -1426,14 +1421,33 @@ async def start_bot_webhook():
         log.error(f"Failed to set webhook: {e}", exc_info=True)
         return None
 
+    # Mark as initialized
+    bot_initialized = True
+    
     log.info("🤖 Bot initialized and ready via webhook")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
 
     return application
 
+async def main_async():
+    """Async main function"""
+    global bot_app
+    
+    bot_app = await initialize_bot()
+    
+    if bot_app is None:
+        log.error("Failed to initialize bot. Exiting.")
+        return
+
+    log.info("Bot is running. Waiting for webhook events...")
+    
+    # Keep the application running
+    while True:
+        await asyncio.sleep(3600)  # Sleep for an hour
+
 def main():
-    """Main function - Python 3.14+ compatible with webhooks"""
+    """Main function"""
     print("\n" + "=" * 60)
     print("🤖 TELEGRAM FILE BOT - Python 3.14+ Compatibility Mode (Webhook)")
     print("=" * 60)
@@ -1443,7 +1457,7 @@ def main():
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
-    # Start Flask in a separate thread (this is fine for web server)
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
     log.info("Flask thread started")
@@ -1451,22 +1465,9 @@ def main():
     # Give Flask a moment to start
     time.sleep(2)
 
-    # Create and set event loop for the main thread (bot)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    global bot_app
+    # Run the async main function
     try:
-        # Initialize bot with webhook
-        bot_app = loop.run_until_complete(start_bot_webhook())
-
-        if bot_app is None:
-            log.error("Failed to initialize bot. Exiting.")
-            return
-
-        log.info("Bot is running. Waiting for webhook events...")
-        # Keep the loop running forever to handle background tasks (job queue)
-        loop.run_forever()
+        asyncio.run(main_async())
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
@@ -1474,10 +1475,8 @@ def main():
     finally:
         log.info("Shutting down...")
         if bot_app:
-            # Optionally delete webhook on shutdown? Not necessary for Render.
-            pass
-        loop.run_until_complete(db.close_pool())
-        loop.close()
+            asyncio.run(bot_app.shutdown())
+        asyncio.run(db.close_pool())
         print("Shutdown complete.")
 
 if __name__ == "__main__":
