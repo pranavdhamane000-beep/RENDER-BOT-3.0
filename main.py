@@ -1286,28 +1286,59 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 # ============ BOT STARTUP FUNCTION ============
+# ============ BOT STARTUP FUNCTION WITH DEBUG ============
 async def run_bot():
     """Run the bot with proper polling"""
     global bot_running
     
     try:
-        print("🤖 Starting bot...")
+        print("=" * 50)
+        print("🤖 BOT STARTUP SEQUENCE - DEBUG MODE")
+        print("=" * 50)
         
-        if not BOT_TOKEN or not ADMIN_ID:
-            print("❌ Missing BOT_TOKEN or ADMIN_ID")
+        # Check environment variables
+        print(f"🔍 Checking BOT_TOKEN: {'✅ SET' if BOT_TOKEN else '❌ MISSING'}")
+        if BOT_TOKEN:
+            print(f"   Token starts with: {BOT_TOKEN[:10]}...")
+        
+        print(f"🔍 Checking ADMIN_ID: {'✅ SET' if ADMIN_ID else '❌ MISSING'}")
+        if ADMIN_ID:
+            print(f"   Admin ID: {ADMIN_ID}")
+        
+        print(f"🔍 Checking DATABASE_URL: {'✅ SET' if DATABASE_URL else '❌ MISSING'}")
+        if DATABASE_URL:
+            print(f"   DB URL starts with: {DATABASE_URL[:20]}...")
+        
+        if not BOT_TOKEN or not ADMIN_ID or not DATABASE_URL:
+            print("❌ CRITICAL: Missing required environment variables!")
             bot_running = False
             return
         
         # Initialize database
-        print("🔄 Connecting to database...")
-        await db.get_connection()
-        file_count = await db.get_file_count()
-        user_count = await db.get_user_count()
-        print(f"✅ Database connected. Files: {file_count}, Users: {user_count}")
+        print("\n🔄 Attempting database connection...")
+        try:
+            await db.get_connection()
+            file_count = await db.get_file_count()
+            user_count = await db.get_user_count()
+            print(f"✅ Database connected successfully!")
+            print(f"   Files in DB: {file_count}")
+            print(f"   Users in DB: {user_count}")
+        except Exception as e:
+            print(f"❌ Database connection FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            bot_running = False
+            return
         
         # Create application
-        print("🔄 Creating bot application...")
-        application = Application.builder().token(BOT_TOKEN).build()
+        print("\n🔄 Creating bot application...")
+        try:
+            application = Application.builder().token(BOT_TOKEN).build()
+            print("✅ Bot application created")
+        except Exception as e:
+            print(f"❌ Failed to create bot application: {e}")
+            bot_running = False
+            return
         
         # Add job queue for cleanup
         if application.job_queue:
@@ -1316,8 +1347,10 @@ async def run_bot():
                 interval=300,
                 first=10
             )
+            print("✅ Job queue setup complete")
         
         # Add handlers
+        print("🔄 Registering handlers...")
         application.add_error_handler(error_handler)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("stats", stats))
@@ -1336,15 +1369,16 @@ async def run_bot():
         application.add_handler(
             MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
         )
-        
-        print("✅ Bot handlers registered")
+        print("✅ Handlers registered")
         
         # Initialize and start the bot
-        print("🚀 Initializing bot...")
+        print("\n🚀 Initializing bot...")
         await application.initialize()
+        print("✅ Bot initialized")
         
         print("🚀 Starting bot...")
         await application.start()
+        print("✅ Bot started")
         
         print("🚀 Starting polling...")
         await application.updater.start_polling(
@@ -1353,15 +1387,20 @@ async def run_bot():
             allowed_updates=Update.ALL_TYPES
         )
         
-        print("✅ Bot is now polling and responding!")
+        print("\n" + "=" * 50)
+        print("✅✅✅ BOT IS NOW RUNNING AND POLLING! ✅✅✅")
+        print("=" * 50)
         bot_running = True
         
         # Keep the bot running
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
+            # Print heartbeat every 30 seconds
+            if int(time.time()) % 30 == 0:
+                print(f"❤️ Bot heartbeat - still running... (Files: {file_count}, Users: {user_count})")
             
     except Exception as e:
-        print(f"❌ Bot error: {e}")
+        print(f"\n❌❌❌ BOT CRASHED: {e} ❌❌❌")
         import traceback
         traceback.print_exc()
         bot_running = False
@@ -1374,16 +1413,20 @@ async def run_bot():
 
 def start_bot_thread():
     """Start the bot in a separate thread with its own event loop"""
+    print("🟢 Bot thread started")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(run_bot())
     except Exception as e:
         print(f"❌ Bot thread error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
+        print("🔴 Bot thread ending")
         loop.close()
 
-# ============ MAIN ============
+# Update your main function with better thread monitoring
 def main():
     """Main function"""
     print("\n" + "=" * 60)
@@ -1391,7 +1434,7 @@ def main():
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin ID: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL (PERMANENT)")
+    print(f"✅ Database URL: {'SET' if DATABASE_URL else 'MISSING'}")
     print("=" * 60 + "\n")
     
     # Get port from environment
@@ -1402,10 +1445,23 @@ def main():
     bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
     
-    # Give bot time to initialize
-    time.sleep(3)
+    # Monitor bot thread
+    def check_bot_thread():
+        while True:
+            time.sleep(10)
+            if not bot_thread.is_alive():
+                print("⚠️⚠️⚠️ BOT THREAD DIED! ⚠️⚠️⚠️")
+                global bot_running
+                bot_running = False
     
-    # Start Flask in the main thread (this blocks)
+    monitor_thread = threading.Thread(target=check_bot_thread, daemon=True)
+    monitor_thread.start()
+    
+    # Give bot time to initialize
+    print("⏳ Waiting for bot to initialize...")
+    time.sleep(5)
+    
+    # Start Flask in the main thread
     print(f"🌐 Starting web server on port {port}...")
     print(f"📊 Dashboard: http://localhost:{port}/")
     print("=" * 60)
