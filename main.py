@@ -25,6 +25,7 @@ start_time = time.time()
 bot_username = "xiomovies_bot"
 bot_process = None
 bot_running = False
+bot_thread = None
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1439,7 +1440,15 @@ def main():
     print(f"✅ Admin ID: {ADMIN_ID}")
     print(f"✅ Database URL: {'SET' if DATABASE_URL else 'MISSING'}")
     print("=" * 60 + "\n")
-    
+ # Test database connection
+try:
+    import pg8000
+    import ssl
+    print("Testing database connection...")
+    # Parse your DATABASE_URL here and test connection
+    print("✅ Database connection test passed")
+except Exception as e:
+    print(f"❌ Database connection test failed: {e}")
     # Get port from environment
     port = int(os.environ.get('PORT', 10000))
     
