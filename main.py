@@ -665,78 +665,74 @@ def home():
             border-radius: 10px;
             box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
         }
-        h1 { color: white; margin-top: 0; font-size: 1.5rem; }
+        h1 { color: white; margin-top: 0; }
         .status { 
-            background: rgba(0, 255, 0, 0.2); 
-            padding: 10px; 
+            padding: 15px; 
             border-radius: 8px; 
             margin: 10px 0;
-            border-left: 4px solid #00ff00;
+            border-left: 4px solid;
         }
+        .status.running { background: rgba(0, 255, 0, 0.2); border-left-color: #00ff00; }
+        .status.stopped { background: rgba(255, 0, 0, 0.2); border-left-color: #ff0000; }
         .info { 
             background: rgba(255, 255, 255, 0.1);
-            padding: 10px;
+            padding: 15px;
             border-radius: 8px;
             margin: 10px 0;
         }
-        a { 
-            color: #FFD700; 
-            text-decoration: none; 
+        .debug {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            font-family: monospace;
+            font-size: 14px;
         }
         .btn {
             display: inline-block;
             background: #4CAF50;
             color: white;
-            padding: 8px 16px;
+            padding: 10px 20px;
             border-radius: 6px;
+            text-decoration: none;
             margin: 5px;
-            font-size: 0.9rem;
         }
-        .warning {
-            background: rgba(255, 165, 0, 0.2);
-            border-left: 4px solid #ffa500;
-            padding: 10px;
-            border-radius: 8px;
-            margin: 10px 0;
-            font-size: 0.9rem;
-        }
-        code {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 2px 4px;
-            border-radius: 3px;
-            font-family: monospace;
-            font-size: 0.9rem;
-        }
-        ul { padding-left: 20px; }
-        li { margin: 5px 0; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🤖 Telegram File Bot</h1>
-        <div class="status">
-            <h3>✅ Status: <strong>ACTIVE</strong></h3>
-            <p>Bot is running on Render with PostgreSQL</p>
-            <p>Bot Status: {{ bot_status }}</p>
+        
+        <div class="status {{ 'running' if bot_running else 'stopped' }}">
+            <h3>Bot Status: <strong>{{ bot_status }}</strong></h3>
             <p>Uptime: {{ uptime }}</p>
-            <p>Files in DB: {{ file_count }}</p>
-            <p>Users in DB: {{ user_count }}</p>
-            <p>📁 Storage: PERMANENT PostgreSQL</p>
         </div>
         
         <div class="info">
-            <h3>📊 Bot Information</h3>
+            <h3>📊 Statistics</h3>
             <ul>
-                <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Database: <strong>Render PostgreSQL</strong></li>
-                <li>Storage: <strong>PERMANENT - Survives restarts!</strong></li>
-                <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
+                <li>Files in DB: {{ file_count }}</li>
+                <li>Users in DB: {{ user_count }}</li>
+                <li>Bot: @{{ bot_username }}</li>
+                <li>Auto-delete: {{ delete_minutes }} minutes</li>
+            </ul>
+        </div>
+        
+        <div class="debug">
+            <h3>🔧 Debug Info</h3>
+            <ul>
+                <li>BOT_TOKEN: {{ '✅ SET' if bot_token else '❌ MISSING' }}</li>
+                <li>ADMIN_ID: {{ '✅ SET' if admin_id else '❌ MISSING' }} (ID: {{ admin_id_value }})</li>
+                <li>DATABASE_URL: {{ '✅ SET' if db_url else '❌ MISSING' }}</li>
+                <li>CHANNEL_1: @{{ channel1 }}</li>
+                <li>CHANNEL_2: @{{ channel2 }}</li>
+                <li>Bot Thread Alive: {{ '✅ YES' if bot_thread_alive else '❌ NO' }}</li>
             </ul>
         </div>
         
         <div class="info">
-            <h3>📞 Start Bot</h3>
-            <p><a href="https://t.me/{{ bot_username }}" target="_blank" class="btn">Start @{{ bot_username }}</a></p>
+            <a href="https://t.me/{{ bot_username }}" class="btn">Start Bot on Telegram</a>
+            <a href="/health" class="btn">Health Check (JSON)</a>
         </div>
     </div>
 </body>
@@ -746,26 +742,33 @@ def home():
     uptime_seconds = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
     
-    global bot_running
-    bot_status = "🟢 RUNNING" if bot_running else "🔴 STOPPED"
+    global bot_running, bot_thread
     
     try:
         file_count = run_async(db.get_file_count())
         user_count = run_async(db.get_user_count())
-    except:
-        file_count = 0
-        user_count = 0
+    except Exception as e:
+        print(f"Error getting counts: {e}")
+        file_count = "ERROR"
+        user_count = "ERROR"
     
-    return render_template_string(html_content, 
-                                  bot_status=bot_status,
-                                  bot_username=bot_username,
-                                  uptime=uptime_str,
-                                  current_time=datetime.now().strftime("%H:%M:%S"),
-                                  file_count=file_count,
-                                  user_count=user_count,
-                                  channel1=CHANNEL_1,
-                                  channel2=CHANNEL_2,
-                                  delete_minutes=DELETE_AFTER//60)
+    return render_template_string(
+        html_content,
+        bot_status="🟢 RUNNING" if bot_running else "🔴 STOPPED",
+        bot_running=bot_running,
+        uptime=uptime_str,
+        file_count=file_count,
+        user_count=user_count,
+        bot_username=bot_username,
+        delete_minutes=DELETE_AFTER//60,
+        bot_token=bool(BOT_TOKEN),
+        admin_id=bool(ADMIN_ID),
+        admin_id_value=ADMIN_ID if ADMIN_ID else "Not set",
+        db_url=bool(DATABASE_URL),
+        channel1=CHANNEL_1,
+        channel2=CHANNEL_2,
+        bot_thread_alive=bot_thread.is_alive() if bot_thread else False
+    )
 
 @app.route('/health')
 def health():
