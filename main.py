@@ -21,7 +21,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xoticcroissant_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
@@ -44,9 +44,11 @@ from telegram.request import HTTPXRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# Channel usernames (without @)
-CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
-CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
+# Default channels (will be added to database on first run)
+DEFAULT_CHANNELS = [
+    os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", ""),
+    os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
+]
 
 # ============ RENDER POSTGRESQL WITH PSYCOPG2 ============
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -57,7 +59,8 @@ if not DATABASE_URL:
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
-AUTO_CLEANUP_DAYS = 0  # NEVER auto-cleanup
+# REMOVED AUTO CLEANUP - Set to 0 (disabled)
+AUTO_CLEANUP_DAYS = 0  # DISABLED - No auto cleanup
 
 # Playable formats
 PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
@@ -66,6 +69,17 @@ PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
 ALL_VIDEO_EXTS = {
     "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v",
     "3gp", "wmv", "mpg", "mpeg"
+}
+
+# Friendly channel names (for UI) - You can customize these!
+CHANNEL_NAMES = {
+    # Add friendly names for your channels here
+    # Format: "channel_username": "Display Name"
+    "A_Knight_of_the_Seven_Kingdoms_t": "Channel 1",
+    "A_Knight_of_the_Seven_Kingdoms_r": "Main Channel",
+    "A_Knight_of_the_Seven_Kingdoms_y": "Backup Channel",
+    "your_movies_web": "Movies Channel",
+    # Add more as needed
 }
 
 # =========================================
@@ -139,6 +153,7 @@ class Database:
 
     def _init_db(self, conn, cur):
         """Initialize database tables (synchronous)"""
+        # Files table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id SERIAL PRIMARY KEY,
@@ -151,6 +166,8 @@ class Database:
                 access_count INTEGER DEFAULT 0
             )
         ''')
+        
+        # Membership cache table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS membership_cache (
                 user_id BIGINT,
@@ -160,6 +177,8 @@ class Database:
                 PRIMARY KEY (user_id, channel)
             )
         ''')
+        
+        # Scheduled deletions table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS scheduled_deletions (
                 chat_id BIGINT NOT NULL,
@@ -169,6 +188,8 @@ class Database:
                 PRIMARY KEY (chat_id, message_id)
             )
         ''')
+        
+        # Users table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -182,11 +203,44 @@ class Database:
                 last_file_accessed TIMESTAMP
             )
         ''')
+        
+        # Required channels table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id SERIAL PRIMARY KEY,
+                channel_username TEXT UNIQUE NOT NULL,
+                channel_name TEXT,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1,
+                position INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Create indexes
         cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_channels_active ON required_channels(is_active)')
+        
+        # Insert default channels if table is empty
+        cur.execute("SELECT COUNT(*) FROM required_channels")
+        count = cur.fetchone()[0]
+        
+        if count == 0 and DEFAULT_CHANNELS:
+            for i, channel in enumerate(DEFAULT_CHANNELS):
+                if channel:  # Only if not empty
+                    # Get friendly name from dictionary or use default
+                    friendly_name = CHANNEL_NAMES.get(channel, f"Channel {i+1}")
+                    cur.execute('''
+                        INSERT INTO required_channels (channel_username, channel_name, position, is_active)
+                        VALUES (%s, %s, %s, 1)
+                        ON CONFLICT (channel_username) DO NOTHING
+                    ''', (channel, friendly_name, i))
+                    log.info(f"Added default channel: {channel} as '{friendly_name}'")
+        
         conn.commit()
 
     @asynccontextmanager
@@ -236,6 +290,190 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
+    # ============ Get database storage usage (REAL PostgreSQL size) ============
+    async def get_db_storage_usage(self) -> Dict[str, Any]:
+        """Get PostgreSQL database storage usage (REAL disk usage)"""
+        try:
+            # Query to get database size
+            result = await self.fetchrow('''
+                SELECT 
+                    pg_database_size(current_database()) as total_bytes,
+                    (SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as table_bytes,
+                    (SELECT COALESCE(SUM(pg_indexes_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as index_bytes
+            ''')
+            
+            if result:
+                total_bytes = result['total_bytes'] or 0
+                table_bytes = result['table_bytes'] or 0
+                index_bytes = result['index_bytes'] or 0
+                
+                # Convert to human readable format
+                def format_bytes(bytes_val):
+                    if bytes_val < 1024:
+                        return f"{bytes_val} B"
+                    elif bytes_val < 1024 * 1024:
+                        return f"{bytes_val/1024:.2f} KB"
+                    elif bytes_val < 1024 * 1024 * 1024:
+                        return f"{bytes_val/(1024*1024):.2f} MB"
+                    else:
+                        return f"{bytes_val/(1024*1024*1024):.2f} GB"
+                
+                return {
+                    'total': format_bytes(total_bytes),
+                    'total_bytes': total_bytes,
+                    'tables': format_bytes(table_bytes),
+                    'indexes': format_bytes(index_bytes),
+                    'tables_bytes': table_bytes,
+                    'indexes_bytes': index_bytes
+                }
+        except Exception as e:
+            log.error(f"Error getting DB storage: {e}")
+        
+        return {
+            'total': 'Unknown',
+            'total_bytes': 0,
+            'tables': 'Unknown',
+            'indexes': 'Unknown'
+        }
+
+    # ============ Get metadata storage info ============
+    async def get_metadata_storage_info(self) -> Dict[str, Any]:
+        """Get detailed metadata storage info (what's actually in DB)"""
+        try:
+            # Get row counts for main tables
+            files_count = await self.get_file_count()
+            users_count = await self.get_user_count()
+            
+            # Get cache size
+            cache_result = await self.fetchrow("SELECT COUNT(*) as count FROM membership_cache")
+            cache_count = cache_result['count'] if cache_result else 0
+            
+            # Get channels count
+            channels_count = await self.get_channel_count()
+            
+            # Estimate metadata size (approximate)
+            # Each file record ~200 bytes, each user ~150 bytes, each cache entry ~50 bytes
+            estimated_metadata_bytes = (files_count * 200) + (users_count * 150) + (cache_count * 50) + (channels_count * 100)
+            
+            def format_bytes(bytes_val):
+                if bytes_val < 1024:
+                    return f"{bytes_val} B"
+                elif bytes_val < 1024 * 1024:
+                    return f"{bytes_val/1024:.2f} KB"
+                else:
+                    return f"{bytes_val/(1024*1024):.2f} MB"
+            
+            return {
+                'files_count': files_count,
+                'users_count': users_count,
+                'cache_entries': cache_count,
+                'channels_count': channels_count,
+                'estimated_metadata': format_bytes(estimated_metadata_bytes),
+                'estimated_bytes': estimated_metadata_bytes
+            }
+        except Exception as e:
+            log.error(f"Error getting metadata info: {e}")
+            return {
+                'files_count': 0,
+                'users_count': 0,
+                'cache_entries': 0,
+                'channels_count': 0,
+                'estimated_metadata': 'Unknown',
+                'estimated_bytes': 0
+            }
+
+    # ============ Get total size of files uploaded (for info only) ============
+    async def get_total_uploaded_size(self) -> int:
+        """Get total size of all files uploaded (sum of file_size column)"""
+        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
+        return result['total'] if result else 0
+
+    # ============ Channel management methods ============
+    async def get_required_channels(self, active_only: bool = True) -> List[str]:
+        """Get list of all required channels"""
+        if active_only:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels WHERE is_active = 1 ORDER BY position, id")
+        else:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels ORDER BY position, id")
+        
+        return [row['channel_username'] for row in rows]
+    
+    async def get_channels_with_details(self) -> List[Dict]:
+        """Get channels with all details for listing"""
+        rows = await self.fetchall('''
+            SELECT id, channel_username, channel_name, added_at, is_active, position
+            FROM required_channels
+            ORDER BY position, id
+        ''')
+        return [dict(row) for row in rows]
+    
+    async def add_channel(self, channel_username: str, added_by: int, channel_name: str = None) -> bool:
+        """Add a new required channel"""
+        # Clean username (remove @ if present)
+        clean_username = channel_username.replace("@", "").strip()
+        
+        if not clean_username:
+            return False
+        
+        # Use friendly name from dictionary if available
+        friendly_name = channel_name or CHANNEL_NAMES.get(clean_username, clean_username)
+        
+        # Get max position for new channel
+        result = await self.fetchrow("SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM required_channels")
+        next_pos = result['next_pos'] if result else 0
+        
+        try:
+            await self.execute_and_commit('''
+                INSERT INTO required_channels (channel_username, channel_name, added_by, position, is_active)
+                VALUES (%s, %s, %s, %s, 1)
+                ON CONFLICT (channel_username) DO UPDATE
+                SET is_active = 1,
+                    added_by = EXCLUDED.added_by,
+                    channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
+            ''', (clean_username, friendly_name, added_by, next_pos))
+            
+            log.info(f"Channel added: @{clean_username} as '{friendly_name}' by user {added_by}")
+            return True
+        except Exception as e:
+            log.error(f"Error adding channel: {e}")
+            return False
+    
+    async def remove_channel(self, channel_username: str) -> bool:
+        """Remove a required channel (soft delete by setting inactive)"""
+        clean_username = channel_username.replace("@", "").strip()
+        
+        rowcount = await self.execute_and_commit('''
+            UPDATE required_channels SET is_active = 0
+            WHERE channel_username = %s
+        ''', (clean_username,))
+        
+        if rowcount > 0:
+            log.info(f"Channel removed: @{clean_username}")
+            
+            # Also clear cache for this channel
+            await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
+            return True
+        return False
+    
+    async def update_channel_name(self, channel_username: str, new_name: str) -> bool:
+        """Update friendly name for a channel"""
+        clean_username = channel_username.replace("@", "").strip()
+        
+        rowcount = await self.execute_and_commit('''
+            UPDATE required_channels SET channel_name = %s
+            WHERE channel_username = %s
+        ''', (new_name, clean_username))
+        
+        return rowcount > 0
+    
+    async def get_channel_count(self) -> int:
+        """Get number of active required channels"""
+        result = await self.fetchrow("SELECT COUNT(*) as count FROM required_channels WHERE is_active = 1")
+        return result['count'] if result else 0
+
+    # ============ Existing database methods ============
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID."""
         async with self.get_db_connection() as conn:
@@ -308,11 +546,20 @@ class Database:
         ''', (user_id, channel))
         return bool(result['is_member']) if result else None
 
-    async def clear_membership_cache(self, user_id: Optional[int] = None):
-        """Clear membership cache for a user or all users."""
-        if user_id:
+    async def clear_membership_cache(self, user_id: Optional[int] = None, channel: Optional[str] = None):
+        """Clear membership cache for a user, channel, or all."""
+        if user_id and channel:
+            await self.execute_and_commit(
+                "DELETE FROM membership_cache WHERE user_id = %s AND channel = %s",
+                (user_id, channel.replace("@", ""))
+            )
+        elif user_id:
             await self.execute_and_commit("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
-            log.info(f"Cleared cache for user {user_id}")
+        elif channel:
+            await self.execute_and_commit(
+                "DELETE FROM membership_cache WHERE channel = %s",
+                (channel.replace("@", ""),)
+            )
         else:
             await self.execute_and_commit("DELETE FROM membership_cache")
             log.info("Cleared all membership cache")
@@ -563,13 +810,18 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
 
-# ============ MEMBERSHIP CHECK ============
+# ============ DYNAMIC MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
     """Check if user is in channel"""
+    clean_channel = channel.replace("@", "")
+    
     if not force_check:
-        cached = await db.get_cached_membership(user_id, channel)
+        cached = await db.get_cached_membership(user_id, clean_channel)
         if cached is not None:
+            log.info(f"✅ CACHE HIT: User {user_id} in {clean_channel}: {cached}")
             return cached
+        else:
+            log.info(f"🔄 CACHE MISS: User {user_id} in {clean_channel}")
 
     try:
         if not channel.startswith("@"):
@@ -577,53 +829,82 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         else:
             channel_username = channel
 
+        log.info(f"🔍 Checking user {user_id} in channel {channel_username}")
         member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
         is_member = member.status in ["member", "administrator", "creator"]
+        log.info(f"✅ User {user_id} in {clean_channel}: {is_member} (status: {member.status})")
 
-        await db.cache_membership(user_id, channel.replace("@", ""), is_member)
+        await db.cache_membership(user_id, clean_channel, is_member)
         return is_member
 
     except Exception as e:
         error_msg = str(e).lower()
+        log.error(f"❌ Error checking user {user_id} in {clean_channel}: {error_msg}")
+        
         if "user not found" in error_msg or "user not participant" in error_msg:
-            await db.cache_membership(user_id, channel.replace("@", ""), False)
+            await db.cache_membership(user_id, clean_channel, False)
             return False
         elif "chat not found" in error_msg:
-            log.error(f"Channel @{channel} not found!")
+            log.error(f"Channel @{clean_channel} not found!")
+            # Still return True to allow access if channel doesn't exist
             return True
         elif "forbidden" in error_msg:
-            log.error(f"Bot can't access @{channel}")
+            log.error(f"Bot can't access @{clean_channel}")
             return True
         else:
             return True
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
-    """Check if user is member of both channels"""
+    """Check if user is member of all required channels"""
     bot = context.bot
 
     result = {
-        "channel1": False,
-        "channel2": False,
         "all_joined": False,
-        "missing_channels": []
+        "missing_channels": [],
+        "missing_channel_names": [],
+        "channel_status": {}
     }
 
+    # Get all active required channels with details (ALWAYS fetch fresh from DB)
+    log.info(f"📋 Fetching active channels from database for user {user_id}")
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
+    
+    log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
+    
+    if not active_channels:
+        # No channels required - auto approve
+        log.info(f"✅ No channels required for user {user_id} - auto approving")
+        result["all_joined"] = True
+        return result
+
     if force_check:
+        log.info(f"🔄 Force check - clearing cache for user {user_id}")
         await db.clear_membership_cache(user_id)
 
-    # Check channel 1
-    ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
-    result["channel1"] = ch1_result
-    if not ch1_result:
-        result["missing_channels"].append(f"@{CHANNEL_1}")
+    # Check each channel
+    for channel_data in active_channels:
+        channel = channel_data['channel_username']
+        channel_name = channel_data['channel_name'] or channel
+        
+        log.info(f"🔍 Checking user {user_id} in channel @{channel} ({channel_name})")
+        is_member = await check_user_in_channel(bot, channel, user_id, force_check)
+        
+        result["channel_status"][channel] = {
+            'is_member': is_member,
+            'name': channel_name
+        }
+        
+        if not is_member:
+            log.info(f"❌ User {user_id} NOT in channel @{channel}")
+            result["missing_channels"].append(channel)
+            result["missing_channel_names"].append(channel_name)
+        else:
+            log.info(f"✅ User {user_id} IS in channel @{channel}")
 
-    # Check channel 2
-    ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
-    result["channel2"] = ch2_result
-    if not ch2_result:
-        result["missing_channels"].append(f"@{CHANNEL_2}")
-
-    result["all_joined"] = result["channel1"] and result["channel2"]
+    result["all_joined"] = len(result["missing_channels"]) == 0
+    log.info(f"📊 Final result for user {user_id}: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
+    
     return result
 
 # ============ WEB ROUTES ============
@@ -706,7 +987,8 @@ def home():
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
-            <p>📁 Storage: PERMANENT PostgreSQL</p>
+            <p>Required Channels: {{ channel_count }}</p>
+            <p>📁 Storage: Metadata only (files stored on Telegram)</p>
         </div>
 
         <div class="info">
@@ -714,9 +996,10 @@ def home():
             <ul>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
                 <li>Database: <strong>Render PostgreSQL</strong></li>
-                <li>Driver: <strong>psycopg2-binary (C-based, fast)</strong></li>
-                <li>Storage: <strong>PERMANENT - Survives restarts!</strong></li>
+                <li>Driver: <strong>psycopg2-binary</strong></li>
+                <li>Storage: <strong>Metadata only - Files on Telegram</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
+                <li>Dynamic Channels: <strong>Yes (Add/Remove anytime)</strong></li>
             </ul>
         </div>
 
@@ -738,11 +1021,13 @@ def home():
         asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        channel_count = loop.run_until_complete(db.get_channel_count())
         loop.close()
     except Exception as e:
         log.error(f"Error fetching counts for home route: {e}")
         file_count = 0
         user_count = 0
+        channel_count = 0
 
     return render_template_string(html_content,
                                   bot_username=bot_username,
@@ -750,8 +1035,7 @@ def home():
                                   current_time=datetime.now().strftime("%H:%M:%S"),
                                   file_count=file_count,
                                   user_count=user_count,
-                                  channel1=CHANNEL_1,
-                                  channel2=CHANNEL_2,
+                                  channel_count=channel_count,
                                   delete_minutes=DELETE_AFTER//60)
 
 @app.route('/health')
@@ -761,11 +1045,13 @@ def health():
         asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        channel_count = loop.run_until_complete(db.get_channel_count())
         loop.close()
     except Exception as e:
         log.error(f"Error in health check: {e}")
         file_count = 0
         user_count = 0
+        channel_count = 0
 
     return jsonify({
         "status": "OK",
@@ -774,9 +1060,12 @@ def health():
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "database": "postgresql",
         "driver": "psycopg2-binary",
-        "storage": "permanent",
+        "storage": "metadata_only",
+        "auto_cleanup": False,
         "file_count": file_count,
         "user_count": user_count,
+        "channel_count": channel_count,
+        "dynamic_channels": True,
         "bot_initialized": bot_initialized
     }), 200
 
@@ -844,8 +1133,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
 
+# ============ FIXED START COMMAND - Shows ALL missing channels ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
+    """Start command handler - FIXED: Shows buttons for ALL missing channels"""
     try:
         if not update.message:
             return
@@ -853,69 +1143,121 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         args = context.args
+        username = update.effective_user.username
+        first_name = update.effective_user.first_name
+
+        log.info(f"🚀 /start command from user {user_id} (@{username}) with args: {args}")
 
         # Update user interaction
-        user = update.effective_user
         await db.update_user_interaction(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
+            user_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=update.effective_user.last_name
         )
 
+        # ALWAYS fetch fresh channel list from database
+        log.info(f"📋 Fetching channels for user {user_id}")
+        channels_data = await db.get_channels_with_details()
+        active_channels = [c for c in channels_data if c['is_active'] == 1]
+        
+        log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
+        
         # No file key - show welcome
         if not args:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                [InlineKeyboardButton("🔄 Check Membership", callback_data="check_membership")]
-            ]
+            log.info(f"👋 Showing welcome menu to user {user_id}")
+            keyboard = []
+            
+            # Add buttons for each required channel with friendly names
+            for channel_data in active_channels:
+                channel = channel_data['channel_username']
+                channel_name = channel_data['channel_name'] or f"Channel"
+                keyboard.append([InlineKeyboardButton(
+                    f"📢 Join {channel_name}", 
+                    url=f"https://t.me/{channel}"
+                )])
+            
+            # Add check membership button
+            keyboard.append([InlineKeyboardButton(
+                "🔄 Check Membership", 
+                callback_data="check_membership"
+            )])
+
+            if active_channels:
+                channel_list = "\n".join([f"{i+1}. {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
+            else:
+                channel_list = "No channels required!"
 
             sent_msg = await update.message.reply_text(
                 "🤖 *Welcome to File Sharing Bot*\n\n"
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
-                "2️⃣ Join both channels\n"
+                "2️⃣ Join the required channels:\n"
+                f"{channel_list}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* PERMANENT PostgreSQL",
+                "💾 *Storage:* Metadata only (files stored on Telegram)\n"
+                "📢 *Dynamic Channels:* Add/remove anytime by admin",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # File key exists
+        # ============ FILE KEY EXISTS - CHECK MEMBERSHIP ============
         key = args[0]
+        log.info(f"🔑 User {user_id} accessing file key: {key}")
+        
         file_info = await db.get_file(key)
 
         if not file_info:
+            log.warning(f"❌ File key {key} not found for user {user_id}")
             sent_msg = await update.message.reply_text("❌ File not found")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # Check membership
+        log.info(f"📁 File found: {file_info['file_name']}")
+
+        # FORCE CHECK membership with latest channels (ignore cache)
+        log.info(f"🔍 Checking membership for user {user_id} (force=True)")
         result = await check_membership(user_id, context, force_check=True)
 
+        log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
+
         if not result["all_joined"]:
-            missing_count = len(result["missing_channels"])
-
-            if missing_count == 2:
-                keyboard = [
-                    [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                    [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                ]
-                text = "🔒 *Join both channels to access this file*"
+            missing_channels = result["missing_channels"]  # List of channel usernames
+            missing_names = result["missing_channel_names"]  # List of friendly names
+            
+            log.info(f"🔒 User {user_id} missing {len(missing_names)} channels: {missing_names}")
+            
+            # Create keyboard with buttons for EACH missing channel
+            keyboard = []
+            
+            # Add a button for EVERY missing channel
+            for i, channel in enumerate(missing_channels):
+                channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
+                keyboard.append([InlineKeyboardButton(
+                    f"📥 Join {channel_name}", 
+                    url=f"https://t.me/{channel}"
+                )])
+            
+            # Add check again button
+            keyboard.append([InlineKeyboardButton(
+                "✅ Check Again", 
+                callback_data=f"check|{key}"
+            )])
+            
+            # Create appropriate message based on number of missing channels
+            if len(missing_names) == 1:
+                text = f"🔒 *Join {missing_names[0]} to access this file*"
+            elif len(missing_names) == 2:
+                text = f"🔒 *Join {missing_names[0]} and {missing_names[1]} to access this file*"
             else:
-                missing_channel = result["missing_channels"][0].replace("@", "")
-                channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
-                keyboard = [
-                    [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
-                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                ]
-                text = f"🔒 *Join {channel_name} to access this file*"
+                channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                text = f"🔒 *Join {channels_text} to access this file*"
 
+            log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
+            
             sent_msg = await update.message.reply_text(
                 text,
                 parse_mode="Markdown",
@@ -924,16 +1266,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # User has joined - send file
+        # User has joined all channels - send file
+        log.info(f"✅ User {user_id} has joined all channels. Sending file...")
         await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
         try:
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored"
+            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
 
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                log.info(f"🎬 Sending video to user {user_id}: {filename}")
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
@@ -942,6 +1286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True
                 )
             else:
+                log.info(f"📁 Sending document to user {user_id}: {filename}")
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
@@ -950,23 +1295,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+            log.info(f"✅ File sent successfully to user {user_id}")
 
         except Exception as e:
-            log.error(f"Error sending file: {e}")
+            log.error(f"❌ Error sending file to user {user_id}: {e}", exc_info=True)
             sent_msg = await update.message.reply_text("❌ Failed to send file")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
-        log.error(f"Start error: {e}", exc_info=True)
+        log.error(f"❌ Start error: {e}", exc_info=True)
 
+# ============ FIXED CHECK JOIN - Shows ALL missing channels ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback queries"""
+    """Handle callback queries - FIXED: Shows buttons for ALL missing channels"""
     try:
         query = update.callback_query
         await query.answer()
 
         user_id = query.from_user.id
         data = query.data
+        username = query.from_user.username
+
+        log.info(f"🔄 Callback query from user {user_id} (@{username}): {data}")
 
         # Update user interaction
         user = query.from_user
@@ -978,32 +1328,52 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if data == "check_membership":
+            log.info(f"🔍 Checking membership for user {user_id} from callback")
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
+                # Get channels with details
+                channels_data = await db.get_channels_with_details()
+                active_channels = [c for c in channels_data if c['is_active'] == 1]
+                
+                channel_list = "\n".join([f"✅ {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
+                
+                log.info(f"✅ User {user_id} has joined all channels")
                 await query.edit_message_text(
-                    "✅ *You've joined both channels!*\n\n"
-                    "Now you can use file links from admin.",
+                    f"✅ *You've joined all required channels!*\n\n"
+                    f"{channel_list}\n\n"
+                    f"Now you can use file links from admin.",
                     parse_mode="Markdown"
                 )
             else:
-                missing_count = len(result["missing_channels"])
-
-                if missing_count == 2:
-                    keyboard = [
-                        [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                        [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
-                    ]
-                    text = "❌ *Not a member of either channel*"
+                missing_channels = result["missing_channels"]
+                missing_names = result["missing_channel_names"]
+                
+                log.info(f"❌ User {user_id} missing channels: {missing_names}")
+                
+                keyboard = []
+                
+                # Add button for EVERY missing channel
+                for i, channel in enumerate(missing_channels):
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
+                    keyboard.append([InlineKeyboardButton(
+                        f"📥 Join {channel_name}", 
+                        url=f"https://t.me/{channel}"
+                    )])
+                
+                # Add check again button
+                keyboard.append([InlineKeyboardButton(
+                    "🔄 Check Again", 
+                    callback_data="check_membership"
+                )])
+                
+                if len(missing_names) == 1:
+                    text = f"❌ *Missing {missing_names[0]}*"
+                elif len(missing_names) == 2:
+                    text = f"❌ *Missing {missing_names[0]} and {missing_names[1]}*"
                 else:
-                    missing = result["missing_channels"][0].replace("@", "")
-                    name = "Channel 1" if CHANNEL_1 in missing else "Channel 2"
-                    keyboard = [
-                        [InlineKeyboardButton(f"📥 Join {name}", url=f"https://t.me/{missing}")],
-                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
-                    ]
-                    text = f"❌ *Missing {name}*"
+                    channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                    text = f"❌ *Missing {channels_text}*"
 
                 await query.edit_message_text(
                     text,
@@ -1014,32 +1384,45 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("check|"):
             _, key = data.split("|")
+            log.info(f"🔑 Check again for file {key} from user {user_id}")
 
             file_info = await db.get_file(key)
             if not file_info:
+                log.warning(f"❌ File {key} not found")
                 await query.edit_message_text("❌ File not found")
                 return
 
             result = await check_membership(user_id, context, force_check=True)
 
             if not result['all_joined']:
-                missing_count = len(result["missing_channels"])
-
-                if missing_count == 2:
-                    keyboard = [
-                        [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                        [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                    ]
-                    text = "❌ *Join both channels*"
+                missing_channels = result["missing_channels"]
+                missing_names = result["missing_channel_names"]
+                
+                log.info(f"❌ User {user_id} still missing channels: {missing_names}")
+                
+                keyboard = []
+                
+                # Add button for EVERY missing channel
+                for i, channel in enumerate(missing_channels):
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
+                    keyboard.append([InlineKeyboardButton(
+                        f"📥 Join {channel_name}", 
+                        url=f"https://t.me/{channel}"
+                    )])
+                
+                # Add check again button
+                keyboard.append([InlineKeyboardButton(
+                    "✅ Check Again", 
+                    callback_data=f"check|{key}"
+                )])
+                
+                if len(missing_names) == 1:
+                    text = f"❌ *Join {missing_names[0]}*"
+                elif len(missing_names) == 2:
+                    text = f"❌ *Join {missing_names[0]} and {missing_names[1]}*"
                 else:
-                    missing = result["missing_channels"][0].replace("@", "")
-                    name = "Channel 1" if CHANNEL_1 in missing else "Channel 2"
-                    keyboard = [
-                        [InlineKeyboardButton(f"📥 Join {name}", url=f"https://t.me/{missing}")],
-                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                    ]
-                    text = f"❌ *Join {name}*"
+                    channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                    text = f"❌ *Join {channels_text}*"
 
                 await query.edit_message_text(
                     text,
@@ -1048,17 +1431,19 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # Send file
+            # User has joined all channels - send file
+            log.info(f"✅ User {user_id} now joined all channels. Sending file...")
             await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
             try:
                 filename = file_info['file_name']
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored"
+                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
                 chat_id = query.message.chat_id
 
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                    log.info(f"🎬 Sending video to user {user_id}: {filename}")
                     sent = await context.bot.send_video(
                         chat_id=chat_id,
                         video=file_info["file_id"],
@@ -1067,6 +1452,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         supports_streaming=True
                     )
                 else:
+                    log.info(f"📁 Sending document to user {user_id}: {filename}")
                     sent = await context.bot.send_document(
                         chat_id=chat_id,
                         document=file_info["file_id"],
@@ -1078,12 +1464,208 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await schedule_message_deletion(context, sent.chat_id, sent.message_id)
 
             except Exception as e:
-                log.error(f"Failed to send file: {e}")
+                log.error(f"❌ Failed to send file to user {user_id}: {e}", exc_info=True)
                 await query.edit_message_text("❌ Failed to send file")
 
     except Exception as e:
-        log.error(f"Callback error: {e}", exc_info=True)
+        log.error(f"❌ Callback error: {e}", exc_info=True)
 
+# ============ CHANNEL MANAGEMENT COMMANDS ============
+async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new required channel (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /addchannel <channel username> [friendly name]\n"
+            "Example: /addchannel @my_channel \"1\""
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    channel = context.args[0]
+    friendly_name = None
+    
+    # Check if friendly name provided
+    if len(context.args) > 1:
+        friendly_name = " ".join(context.args[1:])
+    
+    user_id = update.effective_user.id
+    
+    # Try to verify bot is admin in the channel
+    try:
+        clean_channel = channel.replace("@", "")
+        chat = await context.bot.get_chat(f"@{clean_channel}")
+        
+        # Check if bot is admin
+        bot_member = await context.bot.get_chat_member(f"@{clean_channel}", context.bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            keyboard = [[InlineKeyboardButton(
+                "🤖 Add Bot to Channel",
+                url=f"https://t.me/{clean_channel}?startchannel=bot"
+            )]]
+            
+            sent_msg = await update.message.reply_text(
+                f"⚠️ *Bot is not an admin in @{clean_channel}*\n\n"
+                f"Make sure to add the bot as admin to check memberships!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+            
+    except Exception as e:
+        log.warning(f"Could not verify bot in channel {channel}: {e}")
+        # Continue anyway - maybe channel exists but bot not added yet
+
+    # Add channel to database
+    success = await db.add_channel(channel, user_id, friendly_name)
+    
+    if success:
+        channels = await db.get_channels_with_details()
+        active_channels = [c for c in channels if c['is_active'] == 1]
+        channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']}" for i, c in enumerate(active_channels)])
+        
+        sent_msg = await update.message.reply_text(
+            f"✅ *Channel added successfully!*\n\n"
+            f"Added: {friendly_name or f'@{channel.replace("@", "")}'}\n\n"
+            f"📋 *Current required channels:*\n{channel_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        sent_msg = await update.message.reply_text(
+            f"❌ Failed to add channel. It might already exist."
+        )
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a required channel (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /removechannel <channel username>\n"
+            "Example: /removechannel @my_channel"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    channel = context.args[0]
+    
+    success = await db.remove_channel(channel)
+    
+    if success:
+        channels = await db.get_channels_with_details()
+        active_channels = [c for c in channels if c['is_active'] == 1]
+        
+        if active_channels:
+            channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']}" for i, c in enumerate(active_channels)])
+        else:
+            channel_list = "No channels required (all access granted)"
+        
+        sent_msg = await update.message.reply_text(
+            f"✅ *Channel removed successfully!*\n\n"
+            f"Removed: @{channel.replace('@', '')}\n\n"
+            f"📋 *Current required channels:*\n{channel_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        sent_msg = await update.message.reply_text(
+            f"❌ Channel not found or already removed."
+        )
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all required channels (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    channels = await db.get_channels_with_details()
+    
+    if not channels:
+        sent_msg = await update.message.reply_text(
+            "📋 *No channels configured*\n\n"
+            "Use /addchannel to add required channels.",
+            parse_mode="Markdown"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    active_channels = [c for c in channels if c['is_active'] == 1]
+    inactive_channels = [c for c in channels if c['is_active'] == 0]
+    
+    msg = f"📋 *Channel Management*\n\n"
+    msg += f"📢 *Active Channels ({len(active_channels)}):*\n"
+    
+    for i, ch in enumerate(active_channels):
+        added_date = ch['added_at'].strftime('%Y-%m-%d') if ch['added_at'] else 'Unknown'
+        display_name = ch['channel_name'] or ch['channel_username']
+        msg += f"{i+1}. {display_name}\n"
+        msg += f"   └ Username: @{ch['channel_username']}\n"
+        msg += f"   └ Added: {added_date}\n"
+    
+    if inactive_channels:
+        msg += f"\n⏸️ *Inactive Channels ({len(inactive_channels)}):*\n"
+        for i, ch in enumerate(inactive_channels):
+            display_name = ch['channel_name'] or ch['channel_username']
+            msg += f"{i+1}. {display_name} (@{ch['channel_username']})\n"
+    
+    msg += f"\n💡 *Commands:*\n"
+    msg += f"/addchannel @channel [name] - Add channel\n"
+    msg += f"/removechannel @channel - Remove channel\n"
+    msg += f"/testchannels - Test bot access to all channels"
+    
+    sent_msg = await update.message.reply_text(msg, parse_mode="Markdown")
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test bot access to all required channels (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
+    
+    if not active_channels:
+        sent_msg = await update.message.reply_text("📋 No channels configured.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    status_msg = await update.message.reply_text("🔍 Testing channel access...")
+    
+    results = []
+    for ch in active_channels:
+        channel = ch['channel_username']
+        display_name = ch['channel_name'] or channel
+        
+        try:
+            chat = await context.bot.get_chat(f"@{channel}")
+            bot_member = await context.bot.get_chat_member(f"@{channel}", context.bot.id)
+            
+            if bot_member.status in ["administrator", "creator"]:
+                results.append(f"✅ {display_name} - Bot is admin")
+            else:
+                results.append(f"⚠️ {display_name} - Bot is member (not admin)")
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "chat not found" in error_msg.lower():
+                results.append(f"❌ {display_name} - Channel not found")
+            elif "forbidden" in error_msg.lower():
+                results.append(f"❌ {display_name} - Bot not in channel")
+            else:
+                results.append(f"❌ {display_name} - Error: {error_msg[:50]}")
+    
+    result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
+    
+    await status_msg.edit_text(result_text, parse_mode="Markdown")
+    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+
+# ============ EXISTING COMMAND HANDLERS ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Upload file handler (admin only)"""
     if update.effective_user.id != ADMIN_ID:
@@ -1133,7 +1715,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Upload Successful*\n\n"
             f"📁 *Name:* `{filename}`\n"
             f"🔑 *Key:* `{key}`\n"
-            f"💾 *Storage:* PERMANENT PostgreSQL\n\n"
+            f"💾 *Storage:* Metadata only (file stored on Telegram)\n\n"
             f"🔗 *Link:*\n`{link}`",
             parse_mode="Markdown"
         )
@@ -1145,30 +1727,86 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stats command (admin only)"""
+    """Stats command (admin only) - Shows REAL database storage"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     uptime = str(timedelta(seconds=int(time.time() - start_time)))
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
+    channel_count = await db.get_channel_count()
+
+    # Get database storage usage (REAL PostgreSQL size)
+    db_storage = await db.get_db_storage_usage()
+    
+    # Get metadata storage info
+    metadata_info = await db.get_metadata_storage_info()
+    
+    # Get total size of files uploaded (for information only)
+    total_uploaded_bytes = await db.get_total_uploaded_size()
+    
+    # Format bytes to human readable
+    def format_bytes(bytes_val):
+        if bytes_val < 1024:
+            return f"{bytes_val} B"
+        elif bytes_val < 1024 * 1024:
+            return f"{bytes_val/1024:.2f} KB"
+        elif bytes_val < 1024 * 1024 * 1024:
+            return f"{bytes_val/(1024*1024):.2f} MB"
+        else:
+            return f"{bytes_val/(1024*1024*1024):.2f} GB"
+    
+    total_uploaded = format_bytes(total_uploaded_bytes)
 
     # Get total accesses
     files = await db.get_all_files()
     total_access = sum(f[5] for f in files) if files else 0
 
-    sent_msg = await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"🤖 Bot: @{bot_username}\n"
-        f"⏱ Uptime: {uptime}\n"
-        f"📁 Files: {file_count}\n"
-        f"👥 Users: {user_count}\n"
-        f"👀 Accesses: {total_access}\n"
-        f"💾 Database: PostgreSQL (permanent)\n"
-        f"⏰ Auto-delete: {DELETE_AFTER//60} minutes",
-        parse_mode="Markdown"
-    )
-    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+    # Escape underscores in bot_username for Markdown
+    escaped_bot_username = bot_username.replace("_", "\\_")
+
+    try:
+        sent_msg = await update.message.reply_text(
+            f"📊 *Bot Statistics*\n\n"
+            f"🤖 Bot: @{escaped_bot_username}\n"
+            f"⏱ Uptime: {uptime}\n\n"
+            f"📁 *Files:* {file_count}\n"
+            f"📦 *Total Uploaded:* {total_uploaded} (on Telegram)\n"
+            f"👥 *Users:* {user_count}\n"
+            f"📢 *Required Channels:* {channel_count}\n"
+            f"👀 *Total Accesses:* {total_access}\n\n"
+            f"💾 *PostgreSQL Storage (REAL):*\n"
+            f"   ├─ Total DB: {db_storage['total']}\n"
+            f"   ├─ Tables: {db_storage['tables']}\n"
+            f"   └─ Indexes: {db_storage['indexes']}\n\n"
+            f"📊 *Metadata Stats:*\n"
+            f"   ├─ Cache Entries: {metadata_info['cache_entries']}\n"
+            f"   └─ Est. Metadata: {metadata_info['estimated_metadata']}\n\n"
+            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
+            f"🧹 Auto Cleanup: DISABLED (Permanent storage)",
+            parse_mode="Markdown"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+    except Exception as e:
+        log.error(f"Error in stats command: {e}", exc_info=True)
+        # Fallback to plain text
+        try:
+            sent_msg = await update.message.reply_text(
+                f"📊 Bot Statistics\n\n"
+                f"🤖 Bot: @{bot_username}\n"
+                f"⏱ Uptime: {uptime}\n"
+                f"📁 Files: {file_count}\n"
+                f"📦 Total Uploaded: {total_uploaded} (on Telegram)\n"
+                f"👥 Users: {user_count}\n"
+                f"📢 Required Channels: {channel_count}\n"
+                f"👀 Accesses: {total_access}\n"
+                f"💾 PostgreSQL: {db_storage['total']}\n"
+                f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
+                f"🧹 Auto Cleanup: DISABLED"
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        except Exception as e2:
+            log.error(f"Even fallback failed: {e2}")
 
 async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List files (admin only)"""
@@ -1228,21 +1866,34 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(msg, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
+# ============ ENHANCED BROADCAST FEATURE ============
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast to users (admin only)"""
+    """Broadcast to users (admin only) - Auto chunk processing with 1000 users per batch"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     if not context.args and not update.message.reply_to_message:
-        sent_msg = await update.message.reply_text("❌ Usage: /broadcast <message> or reply with /broadcast")
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /broadcast <message> or reply with /broadcast\n"
+            "Optional: /broadcast --preview to see preview only\n"
+            "Bot will auto-send in chunks of 1000 users"
+        )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    # Get message text
-    if update.message.reply_to_message:
-        message_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+    # Check for preview mode
+    preview_mode = False
+    args_list = context.args if context.args else []
+    
+    if args_list and args_list[0] == "--preview":
+        preview_mode = True
+        message_text = " ".join(args_list[1:]) if len(args_list) > 1 else ""
     else:
-        message_text = " ".join(context.args)
+        # Get message text
+        if update.message.reply_to_message:
+            message_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+        else:
+            message_text = " ".join(args_list) if args_list else ""
 
     if not message_text:
         sent_msg = await update.message.reply_text("❌ Message cannot be empty")
@@ -1250,97 +1901,267 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Get all users
-    user_ids = await db.get_all_user_ids(exclude_admin=True)
-
     status_msg = await update.message.reply_text(
-        f"🔄 Broadcasting to {len(user_ids)} users...",
+        "📊 Fetching user list...",
         parse_mode="Markdown"
     )
 
+    user_ids = await db.get_all_user_ids(exclude_admin=True)
+    total_users = len(user_ids)
+
+    if total_users == 0:
+        await status_msg.edit_text("❌ No users found to broadcast")
+        return
+
+    # Preview mode - show sample
+    if preview_mode:
+        preview_text = f"🔍 *BROADCAST PREVIEW*\n\n"
+        preview_text += f"📝 *Message:*\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
+        preview_text += f"👥 *Total users:* {total_users}\n"
+        preview_text += f"📦 *Chunks:* {(total_users + 999) // 1000} chunks of 1000\n\n"
+        preview_text += f"*First 5 users:*\n"
+        
+        for i, uid in enumerate(user_ids[:5]):
+            preview_text += f"{i+1}. `{uid}`\n"
+        
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm Broadcast", callback_data=f"confirm_broadcast|{total_users}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")
+        ]]
+        
+        await status_msg.edit_text(
+            preview_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        # Store message text in context for later use
+        context.chat_data['broadcast_message'] = message_text
+        return
+
+    # Direct broadcast without preview
+    await status_msg.edit_text(
+        f"🔄 Starting broadcast to {total_users} users...\n"
+        f"📦 Processing in chunks of 1000 users"
+    )
+    
+    # Start the broadcast process
+    asyncio.create_task(process_broadcast_chunks(context, user_ids, message_text, status_msg))
+
+async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids: list, message_text: str, status_msg: Message):
+    """Process broadcast in chunks of 1000 users"""
+    CHUNK_SIZE = 1000
+    total_users = len(user_ids)
+    total_chunks = (total_users + CHUNK_SIZE - 1) // CHUNK_SIZE
+    
     successful = 0
     failed = 0
+    blocked = 0
+    chunk_results = []
+    
+    start_time = time.time()
+    
+    for chunk_num in range(total_chunks):
+        chunk_start = chunk_num * CHUNK_SIZE
+        chunk_end = min((chunk_num + 1) * CHUNK_SIZE, total_users)
+        chunk_users = user_ids[chunk_start:chunk_end]
+        
+        chunk_success = 0
+        chunk_failed = 0
+        chunk_blocked = 0
+        
+        # Update status for current chunk
+        await status_msg.edit_text(
+            f"📦 *Processing Chunk {chunk_num + 1}/{total_chunks}*\n"
+            f"👥 Users in this chunk: {len(chunk_users)}\n"
+            f"✅ Sent so far: {successful}\n"
+            f"❌ Failed: {failed}\n"
+            f"🚫 Blocked: {blocked}\n"
+            f"⏱️ Chunk {chunk_num + 1} starting...",
+            parse_mode="Markdown"
+        )
+        
+        # Process current chunk
+        for i, user_id in enumerate(chunk_users):
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📢 *Broadcast Message*\n\n{message_text}",
+                    parse_mode="Markdown"
+                )
+                chunk_success += 1
+                successful += 1
+                
+                # Update progress every 100 users within chunk
+                if (i + 1) % 100 == 0:
+                    await status_msg.edit_text(
+                        f"📦 *Chunk {chunk_num + 1}/{total_chunks}* - {i + 1}/{len(chunk_users)} users\n"
+                        f"✅ Sent: {successful}\n"
+                        f"❌ Failed: {failed}\n"
+                        f"🚫 Blocked: {blocked}",
+                        parse_mode="Markdown"
+                    )
+                
+                # Small delay to avoid hitting rate limits
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                if "blocked" in error_str or "forbidden" in error_str or "deactivated" in error_str or "bot was blocked" in error_str:
+                    chunk_blocked += 1
+                    blocked += 1
+                else:
+                    chunk_failed += 1
+                    failed += 1
+                
+                log.warning(f"Failed to send to {user_id}: {e}")
+        
+        # Store chunk result
+        chunk_results.append({
+            'chunk': chunk_num + 1,
+            'users': len(chunk_users),
+            'success': chunk_success,
+            'failed': chunk_failed,
+            'blocked': chunk_blocked
+        })
+        
+        # Update status after chunk completion
+        await status_msg.edit_text(
+            f"✅ *Chunk {chunk_num + 1}/{total_chunks} Complete*\n"
+            f"📊 *Results for this chunk:*\n"
+            f"✅ Sent: {chunk_success}\n"
+            f"❌ Failed: {chunk_failed}\n"
+            f"🚫 Blocked: {chunk_blocked}\n\n"
+            f"📈 *Overall Progress:*\n"
+            f"✅ Total Sent: {successful}\n"
+            f"❌ Total Failed: {failed}\n"
+            f"🚫 Total Blocked: {blocked}\n"
+            f"📊 Completion: {(successful + failed + blocked)/total_users*100:.1f}%",
+            parse_mode="Markdown"
+        )
+        
+        # Delay between chunks (2 seconds to avoid hitting limits)
+        if chunk_num < total_chunks - 1:
+            await asyncio.sleep(2)
+    
+    # Final summary
+    elapsed_time = time.time() - start_time
+    avg_speed = successful / elapsed_time if elapsed_time > 0 else 0
+    
+    # Create detailed summary
+    summary = f"✅ *Broadcast Complete!*\n\n"
+    summary += f"📊 *Final Statistics:*\n"
+    summary += f"👥 Total Users: {total_users}\n"
+    summary += f"✅ Successfully Sent: {successful}\n"
+    summary += f"❌ Failed: {failed}\n"
+    summary += f"🚫 Blocked/Deactivated: {blocked}\n"
+    summary += f"📦 Chunks Processed: {total_chunks}\n"
+    summary += f"⏱️ Time Taken: {elapsed_time:.1f} seconds\n"
+    summary += f"⚡ Avg Speed: {avg_speed:.1f} users/sec\n\n"
+    
+    # Add chunk details
+    summary += f"📋 *Chunk Details:*\n"
+    for chunk in chunk_results:
+        summary += f"Chunk {chunk['chunk']}: {chunk['success']}✅/{chunk['failed']}❌/{chunk['blocked']}🚫\n"
+    
+    # Calculate success rate
+    success_rate = (successful / total_users * 100) if total_users > 0 else 0
+    summary += f"\n📈 Success Rate: {success_rate:.1f}%"
+    
+    await status_msg.edit_text(summary, parse_mode="Markdown")
+    
+    # Log the broadcast
+    log.info(f"Broadcast completed: {successful}/{total_users} successful, {failed} failed, {blocked} blocked")
 
-    for user_id in user_ids[:100]:  # Limit to 100 for free tier
+async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle broadcast confirmation callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "cancel_broadcast":
+        await query.edit_message_text("❌ Broadcast cancelled")
+        return
+    
+    if data.startswith("confirm_broadcast"):
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📢 *Broadcast*\n\n{message_text}",
-                parse_mode="Markdown"
+            total_users = int(data.split("|")[1])
+            
+            # Get the message text from context
+            message_text = context.chat_data.get('broadcast_message', '')
+            
+            if not message_text:
+                await query.edit_message_text("❌ Could not retrieve message. Please try again.")
+                return
+            
+            await query.edit_message_text(
+                f"🔄 Starting broadcast to {total_users} users...\n"
+                f"📦 Processing in chunks of 1000 users"
             )
-            successful += 1
-            await asyncio.sleep(0.05)
+            
+            # Get all users
+            user_ids = await db.get_all_user_ids(exclude_admin=True)
+            
+            # Start the broadcast process
+            asyncio.create_task(process_broadcast_chunks(
+                context, user_ids, message_text, query.message
+            ))
+            
+            # Clear stored message
+            context.chat_data.pop('broadcast_message', None)
+            
         except Exception as e:
-            failed += 1
-            log.warning(f"Failed to send to {user_id}: {e}")
-
-    await status_msg.edit_text(
-        f"✅ Broadcast complete\n✅ Sent: {successful}\n❌ Failed: {failed}",
-        parse_mode="Markdown"
-    )
-    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+            log.error(f"Error in broadcast confirmation: {e}")
+            await query.edit_message_text(f"❌ Error starting broadcast: {str(e)[:100]}")
 
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache (admin only)"""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    await db.clear_membership_cache()
-    sent_msg = await update.message.reply_text("✅ Cache cleared")
+    # Optional: clear cache for specific channel
+    if context.args:
+        channel = context.args[0]
+        await db.clear_membership_cache(channel=channel)
+        sent_msg = await update.message.reply_text(f"✅ Cache cleared for channel {channel}")
+    else:
+        await db.clear_membership_cache()
+        sent_msg = await update.message.reply_text("✅ All cache cleared")
+    
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test channel access (admin only)"""
+    """Test channel access (admin only) - Updated for dynamic channels"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     user_id = update.effective_user.id
-
-    try:
-        member1 = await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
-        ch1 = f"✅ {member1.status}"
-    except Exception as e:
-        ch1 = f"❌ {str(e)[:50]}"
-
-    try:
-        member2 = await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
-        ch2 = f"✅ {member2.status}"
-    except Exception as e:
-        ch2 = f"❌ {str(e)[:50]}"
-
-    sent_msg = await update.message.reply_text(
-        f"🔍 *Channel Test*\n\n"
-        f"@{CHANNEL_1}: {ch1}\n"
-        f"@{CHANNEL_2}: {ch2}",
-        parse_mode="Markdown"
-    )
-    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-
-async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual cleanup (admin only)"""
-    if update.effective_user.id != ADMIN_ID:
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
+    
+    if not active_channels:
+        sent_msg = await update.message.reply_text("📋 No channels configured.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    days = 30
-    if context.args:
+    results = []
+    for ch in active_channels:
+        channel = ch['channel_username']
+        display_name = ch['channel_name'] or channel
+        
         try:
-            days = int(context.args[0])
-        except:
-            pass
+            member = await context.bot.get_chat_member(f"@{channel}", user_id)
+            status = f"✅ {member.status}"
+        except Exception as e:
+            status = f"❌ {str(e)[:50]}"
+        
+        results.append(f"{display_name}: {status}")
 
-    result = await db.execute_and_commit('''
-        DELETE FROM files
-        WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
-    ''', (days,))
-
-    file_count = await db.get_file_count()
-
-    sent_msg = await update.message.reply_text(
-        f"🧹 Cleaned files older than {days} days\n"
-        f"📁 Files remaining: {file_count}",
-        parse_mode="Markdown"
-    )
+    result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
+    
+    sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-
 
 # ============ MAIN ============
 async def initialize_bot():
@@ -1371,7 +2192,7 @@ async def initialize_bot():
     bot_loop = asyncio.get_running_loop()
     bot_app = application
 
-    # Add job queue for cleanup
+    # Add job queue for cleanup (only message deletion, not file cleanup)
     if application.job_queue:
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
@@ -1379,8 +2200,10 @@ async def initialize_bot():
             first=10
         )
 
-    # Add handlers
+    # Add error handler
     application.add_error_handler(error_handler)
+    
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("listfiles", listfiles))
@@ -1389,11 +2212,19 @@ async def initialize_bot():
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
-    application.add_handler(CommandHandler("cleanup", cleanup))
+    
+    # Channel management commands
+    application.add_handler(CommandHandler("addchannel", addchannel))
+    application.add_handler(CommandHandler("removechannel", removechannel))
+    application.add_handler(CommandHandler("listchannels", listchannels))
+    application.add_handler(CommandHandler("testchannels", testchannels))
 
+    # Add callback handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
+    application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)$"))
 
+    # Add upload handler (admin only)
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
@@ -1427,6 +2258,8 @@ async def initialize_bot():
     log.info("🤖 Bot initialized and ready via webhook")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
+    log.info(f"📢 Required channels: {await db.get_channel_count()}")
+    log.info(f"🧹 Auto cleanup: DISABLED (Permanent storage)")
 
     return application
 
@@ -1449,11 +2282,14 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - Python 3.14+ Compatibility Mode (Webhook)")
+    print("🤖 TELEGRAM FILE BOT - DEBUG VERSION - Shows ALL Missing Channels")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL with psycopg2-binary")
+    print(f"✅ Database: Render PostgreSQL")
+    print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
+    print(f"✅ Storage: Metadata only (Files on Telegram)")
+    print(f"✅ DEBUG MODE: Extensive logging enabled")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
