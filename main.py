@@ -1454,18 +1454,30 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
 
         if channel_type == "request":
             is_satisfied = await db.has_join_request_satisfaction(user_id, channel)
+            
+            verification_error = None
+            if not is_satisfied:
+                # If they are already a member (e.g. admin testing), Telegram opens the channel directly
+                # instead of sending a chat_join_request, so we must check actual membership too.
+                is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
+                if is_member:
+                    is_satisfied = True
+                    await db.mark_join_request_satisfied(user_id, channel)
+
             result["channel_status"][channel] = {
                 'is_member': is_satisfied,
                 'name': channel_name,
                 'type': channel_type,
-                'verification_error': None
+                'verification_error': verification_error
             }
 
             if not is_satisfied:
-                log.info(f"User {user_id} has not submitted join request for {channel}")
+                log.info(f"User {user_id} has not submitted join request or joined {channel}")
                 result["missing_channels"].append(channel)
                 result["missing_channel_names"].append(channel_name)
                 result["missing_channel_data"].append(channel_data)
+                if verification_error:
+                    result["verification_errors"].append({'name': channel_name, 'error': verification_error})
             else:
                 log.info(f"User {user_id} satisfied request channel {channel}")
 
@@ -1881,8 +1893,12 @@ def build_join_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build join buttons, optionally with a manual check button."""
     keyboard = []
+    has_normal_channels = False
 
     for index, channel_data in enumerate(missing_channel_data, start=1):
+        if (channel_data.get("channel_type") or "normal") == "normal":
+            has_normal_channels = True
+            
         channel_name = channel_data.get("channel_name") or f"Channel {index}"
         url = channel_button_url(channel_data)
         if url:
@@ -1891,7 +1907,8 @@ def build_join_keyboard(
                 url=url
             )])
 
-    if include_check_button and callback_data:
+    # Only show 'Check Again' button if there is at least one normal channel that requires manual checking
+    if include_check_button and callback_data and has_normal_channels:
         keyboard.append([InlineKeyboardButton(
             "Check Again",
             callback_data=callback_data
@@ -2680,7 +2697,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"check|{key}"
             )])
             await db.save_pending_share_request(user_id, chat_id, key)
-            keyboard_markup = build_join_keyboard(missing_channel_data, f"check|{key}")
+            keyboard_markup = build_join_keyboard(
+                missing_channel_data, 
+                f"check|{key}",
+                include_check_button=True
+            )
             
             # Create appropriate message based on number of missing channels
             if len(missing_names) == 1:
