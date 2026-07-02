@@ -2682,23 +2682,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             log.info(f"🔒 User {user_id} missing {len(missing_names)} channels: {missing_names}")
             
-            # Create keyboard with buttons for EACH missing channel
-            keyboard = []
-            
-            # Add a button for EVERY missing channel
-            for i, channel in enumerate(missing_channels):
-                channel = normalize_channel_username(channel)
-                channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
-                keyboard.append([InlineKeyboardButton(
-                    f"📥 Join {channel_name}", 
-                    url=f"https://t.me/{channel}"
-                )])
-            
-            # Add check again button
-            keyboard.append([InlineKeyboardButton(
-                "✅ Check Again", 
-                callback_data=f"check|{key}"
-            )])
             await db.save_pending_share_request(user_id, chat_id, key)
             keyboard_markup = build_join_keyboard(
                 missing_channel_data, 
@@ -2719,7 +2702,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
                 text += f"\n\n⚠️ *I couldn't verify:* {unresolved}\nPlease make sure the bot is an admin in those channels and try again."
 
-            log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
+            log.info(f"📨 Sending restriction message to user {user_id} with keyboard")
+            
             
             sent_msg = await update.message.reply_text(
                 text,
@@ -2794,22 +2778,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 log.info(f"❌ User {user_id} missing channels: {missing_names}")
                 
-                keyboard = []
-                
-                # Add button for EVERY missing channel
-                for i, channel in enumerate(missing_channels):
-                    channel = normalize_channel_username(channel)
-                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
-                    keyboard.append([InlineKeyboardButton(
-                        f"📥 Join {channel_name}", 
-                        url=f"https://t.me/{channel}"
-                    )])
-                
-                # Add check again button
-                keyboard.append([InlineKeyboardButton(
-                    "🔄 Check Again", 
-                    callback_data="check_membership"
-                )])
                 keyboard_markup = build_join_keyboard(
                     missing_channel_data,
                     "check_membership",
@@ -2855,25 +2823,13 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 log.info(f"❌ User {user_id} still missing channels: {missing_names}")
                 
-                keyboard = []
-                
-                # Add button for EVERY missing channel
-                for i, channel in enumerate(missing_channels):
-                    channel = normalize_channel_username(channel)
-                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
-                    keyboard.append([InlineKeyboardButton(
-                        f"📥 Join {channel_name}", 
-                        url=f"https://t.me/{channel}"
-                    )])
-                
-                # Add check again button
-                keyboard.append([InlineKeyboardButton(
-                    "✅ Check Again", 
-                    callback_data=f"check|{key}"
-                )])
                 chat_id = query.message.chat_id
                 await db.save_pending_share_request(user_id, chat_id, key)
-                keyboard_markup = build_join_keyboard(missing_channel_data, f"check|{key}")
+                keyboard_markup = build_join_keyboard(
+                    missing_channel_data,
+                    f"check|{key}",
+                    include_check_button=True
+                )
                 
                 if len(missing_names) == 1:
                     text = f"❌ *Join {missing_names[0]}*"
