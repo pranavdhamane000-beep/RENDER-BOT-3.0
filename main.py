@@ -24,7 +24,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "itcchiuchiha_bot"
+bot_username = "xoticcroissant_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
@@ -569,6 +569,27 @@ class Database:
         next_pos = result['next_pos'] if result else 0
 
         try:
+            if clean_username and clean_username != channel_key:
+                rowcount = await self.execute_and_commit('''
+                    UPDATE required_channels
+                    SET is_active = 1,
+                        channel_name = %s,
+                        added_by = %s,
+                        channel_type = 'request',
+                        chat_id = %s,
+                        invite_link = %s
+                    WHERE channel_username = %s
+                ''', (friendly_name, added_by, int(chat_id), invite_link, clean_username))
+
+                if rowcount > 0:
+                    await self.execute_and_commit('''
+                        UPDATE required_channels
+                        SET is_active = 0
+                        WHERE channel_username = %s
+                    ''', (channel_key,))
+                    log.info(f"Converted normal channel @{clean_username} to request mode")
+                    return True
+
             await self.execute_and_commit('''
                 INSERT INTO required_channels
                     (channel_username, channel_name, added_by, position, is_active, channel_type, chat_id, invite_link)
@@ -585,7 +606,8 @@ class Database:
             if clean_username != channel_key:
                 await self.execute_and_commit('''
                     UPDATE required_channels
-                    SET chat_id = %s
+                    SET is_active = 0,
+                        chat_id = %s
                     WHERE channel_username = %s AND channel_type = 'normal'
                 ''', (int(chat_id), clean_username))
 
@@ -1399,6 +1421,18 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
     log.info(f"📋 Fetching active channels from database for user {user_id}")
     channels_data = await db.get_channels_with_details()
     active_channels = [c for c in channels_data if c['is_active'] == 1]
+    request_chat_ids = {
+        c.get('chat_id')
+        for c in active_channels
+        if (c.get('channel_type') or 'normal') == 'request' and c.get('chat_id') is not None
+    }
+    active_channels = [
+        c for c in active_channels
+        if not (
+            (c.get('channel_type') or 'normal') == 'normal'
+            and c.get('chat_id') in request_chat_ids
+        )
+    ]
     
     log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
     
@@ -1840,8 +1874,12 @@ def channel_button_url(channel_data: Dict[str, Any]) -> Optional[str]:
     return f"https://t.me/{channel}"
 
 
-def build_join_keyboard(missing_channel_data: List[Dict[str, Any]], callback_data: str) -> InlineKeyboardMarkup:
-    """Build join buttons for missing channels plus a check-again button."""
+def build_join_keyboard(
+    missing_channel_data: List[Dict[str, Any]],
+    callback_data: Optional[str] = None,
+    include_check_button: bool = False
+) -> InlineKeyboardMarkup:
+    """Build join buttons, optionally with a manual check button."""
     keyboard = []
 
     for index, channel_data in enumerate(missing_channel_data, start=1):
@@ -1853,10 +1891,11 @@ def build_join_keyboard(missing_channel_data: List[Dict[str, Any]], callback_dat
                 url=url
             )])
 
-    keyboard.append([InlineKeyboardButton(
-        "Check Again",
-        callback_data=callback_data
-    )])
+    if include_check_button and callback_data:
+        keyboard.append([InlineKeyboardButton(
+            "Check Again",
+            callback_data=callback_data
+        )])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -2747,7 +2786,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🔄 Check Again", 
                     callback_data="check_membership"
                 )])
-                keyboard_markup = build_join_keyboard(missing_channel_data, "check_membership")
+                keyboard_markup = build_join_keyboard(
+                    missing_channel_data,
+                    "check_membership",
+                    include_check_button=True
+                )
                 
                 if len(missing_names) == 1:
                     text = f"❌ *Missing {missing_names[0]}*"
