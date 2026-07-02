@@ -1455,11 +1455,11 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         if channel_type == "request":
             is_satisfied = await db.has_join_request_satisfaction(user_id, channel)
             
-            verification_error = None
             if not is_satisfied:
-                # If they are already a member (e.g. admin testing), Telegram opens the channel directly
-                # instead of sending a chat_join_request, so we must check actual membership too.
-                is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
+                # Fallback: Check if they are already an actual member (e.g. admin testing).
+                # We intentionally ignore any verification_error here so users don't see scary warnings
+                # if the bot temporarily loses admin rights for a request channel.
+                is_member, _ = await check_user_in_channel(bot, channel, user_id, force_check)
                 if is_member:
                     is_satisfied = True
                     await db.mark_join_request_satisfied(user_id, channel)
@@ -1468,7 +1468,7 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
                 'is_member': is_satisfied,
                 'name': channel_name,
                 'type': channel_type,
-                'verification_error': verification_error
+                'verification_error': None
             }
 
             if not is_satisfied:
@@ -1476,8 +1476,6 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
                 result["missing_channels"].append(channel)
                 result["missing_channel_names"].append(channel_name)
                 result["missing_channel_data"].append(channel_data)
-                if verification_error:
-                    result["verification_errors"].append({'name': channel_name, 'error': verification_error})
             else:
                 log.info(f"User {user_id} satisfied request channel {channel}")
 
@@ -2612,9 +2610,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not args:
             log.info(f"👋 Showing welcome menu to user {user_id}")
             keyboard = []
+            has_normal_channels = False
             
             # Add buttons for each required channel with friendly names
             for channel_data in active_channels:
+                if (channel_data.get("channel_type") or "normal") == "normal":
+                    has_normal_channels = True
+                    
                 channel_name = channel_data['channel_name'] or f"Channel"
                 url = channel_button_url(channel_data)
                 if not url:
@@ -2624,11 +2626,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     url=url
                 )])
             
-            # Add check membership button
-            keyboard.append([InlineKeyboardButton(
-                "🔄 Check Membership", 
-                callback_data="check_membership"
-            )])
+            # Add check membership button ONLY if there are normal channels
+            if has_normal_channels:
+                keyboard.append([InlineKeyboardButton(
+                    "🔄 Check Membership", 
+                    callback_data="check_membership"
+                )])
 
             if active_channels:
                 channel_list = "\n".join([f"{i+1}. {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
