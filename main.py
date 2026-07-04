@@ -2600,7 +2600,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if channel_type == 'private' and channel_data.get('invite_link'):
                     keyboard.append([InlineKeyboardButton(
-                        f"📢 Request to Join {channel_name}", 
+                        f"📢 Join {channel_name}", 
                         url=channel_data['invite_link']
                     )])
                 else:
@@ -2698,7 +2698,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             has_private_missing = any(t == 'private' for t in missing_types)
             has_public_missing = any(t != 'private' for t in missing_types)
             action_text = "Join" if has_private_missing and has_public_missing else (
-                "Join" if has_private_missing else "Join"
+                "Request access to" if has_private_missing else "Join"
             )
             if len(safe_missing_names) == 1:
                 text = f"🔒 {action_text} {safe_missing_names[0]} to get this file"
@@ -4710,12 +4710,12 @@ async def initialize_bot():
     log.info(f"Setting webhook to: {webhook_url}")
 
     try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_webhook(
             url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
             max_connections=40,
-            drop_pending_updates=False
+            drop_pending_updates=True
         )
         log.info("✅ Webhook set successfully")
     except Exception as e:
