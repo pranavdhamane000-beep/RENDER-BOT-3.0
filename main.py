@@ -2752,6 +2752,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error(f"❌ Start error: {e}", exc_info=True)
+        try:
+            if update.message:
+                await update.message.reply_text(f"❌ Start error: {e}")
+        except Exception:
+            pass
 
 # ============ CALLBACK HANDLER ============
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
