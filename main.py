@@ -364,6 +364,23 @@ class Database:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_private_requests_user ON private_channel_requests(user_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_pending_delivery_user ON pending_file_delivery(user_id)')
         
+        # ---- Migrations for older databases ----
+        # Add missing columns to required_channels if they don't exist
+        for col_name, col_def in [
+            ('channel_type', "TEXT DEFAULT 'public'"),
+            ('invite_link', 'TEXT'),
+            ('position', 'INTEGER DEFAULT 0'),
+            ('added_by', 'BIGINT'),
+            ('added_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+        ]:
+            cur.execute('''
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'required_channels' AND column_name = %s
+            ''', (col_name,))
+            if not cur.fetchone():
+                cur.execute(f'ALTER TABLE required_channels ADD COLUMN {col_name} {col_def}')
+                log.info(f"Migration: added column '{col_name}' to required_channels")
+        
         # Insert default channels if table is empty
         cur.execute("SELECT COUNT(*) FROM required_channels")
         count = cur.fetchone()[0]
