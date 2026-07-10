@@ -2711,23 +2711,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )])
             
             # Create appropriate message
-            safe_missing_names = [escape_markdown(name) for name in missing_names]
-            has_private_missing = any(t == 'private' for t in missing_types)
-            has_public_missing = any(t != 'private' for t in missing_types)
-            action_text = "Join" if has_private_missing and has_public_missing else (
-                "Request access to" if has_private_missing else "Join"
-            )
-            if len(safe_missing_names) == 1:
-                text = f"🔒 {action_text} {safe_missing_names[0]} to get this file"
-            elif len(safe_missing_names) == 2:
-                text = f"🔒 {action_text} {safe_missing_names[0]} and {safe_missing_names[1]} to get this file"
-            else:
-                channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
-                text = f"🔒 {action_text} {channels_text} to get this file"
-
-            if verification_errors:
-                unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
-                text += f"\n\n File will be provided by Bot."
+            text = "Join all the channels\nBot will send file"
 
             log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
             
@@ -2906,10 +2890,12 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                         return
                     
-                    # Create invite link
+                    # Create invite link (explicit 10 year expiry to prevent auto-expiry issues)
+                    expire_at = int(time.time()) + (10 * 365 * 24 * 3600)
                     invite_link = await context.bot.create_chat_invite_link(
                         chat_id=channel_ref,
-                        creates_join_request=True
+                        creates_join_request=True,
+                        expire_date=expire_at
                     )
                     
                     # Save to database
