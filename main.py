@@ -2890,8 +2890,8 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                         return
                     
-                    # Create invite link (explicit 10 year expiry to prevent auto-expiry issues)
-                    expire_at = int(time.time()) + (10 * 365 * 24 * 3600)
+                    # Create invite link (explicit 1 year expiry, Telegram rejects 10 years)
+                    expire_at = int(time.time()) + (365 * 24 * 3600)
                     invite_link = await context.bot.create_chat_invite_link(
                         chat_id=channel_ref,
                         creates_join_request=True,
