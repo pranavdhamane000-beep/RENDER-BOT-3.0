@@ -2744,7 +2744,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Clean up any pending deliveries
             await db.remove_pending_delivery(user_id, key)
-            await db.clear_user_requests(user_id)
 
         except Exception as e:
             log.error(f"❌ Error sending file to user {user_id}: {e}", exc_info=True)
@@ -2809,7 +2808,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     # Clean up
                     await db.remove_pending_delivery(user_id, key)
-                    await db.clear_user_requests(user_id)
                     
                 except Exception as e:
                     log.error(f"❌ Failed to send file to user {user_id}: {e}", exc_info=True)
