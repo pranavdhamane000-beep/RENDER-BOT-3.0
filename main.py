@@ -184,7 +184,7 @@ class Database:
 
             try:
                 self.pool = psycopg2.pool.ThreadedConnectionPool(
-                    1, 20, dsn=dsn, connect_timeout=30,
+                    1, 50, dsn=dsn, connect_timeout=30,
                     sslmode='require'
                 )
                 log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
@@ -402,11 +402,23 @@ class Database:
     async def get_db_connection(self):
         """Asynchronous context manager to get and return a connection from the pool."""
         await self._get_pool_async()
-        conn = await asyncio.to_thread(self._get_valid_connection_sync)
+        
+        conn = None
+        for attempt in range(15):
+            try:
+                conn = await asyncio.to_thread(self._get_valid_connection_sync)
+                break
+            except pool.PoolError:
+                if attempt == 14:
+                    log.error("Database connection pool exhausted after multiple retries.")
+                    raise
+                await asyncio.sleep(0.5)
+                
         try:
             yield conn
         finally:
-            await asyncio.to_thread(self.pool.putconn, conn)
+            if conn is not None:
+                await asyncio.to_thread(self.pool.putconn, conn)
 
     async def execute(self, query: str, params: tuple = None):
         """Execute a query and return cursor"""
