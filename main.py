@@ -100,6 +100,10 @@ from telegram.ext import (
     ChatMemberHandler
 )
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError
+
+# Global semaphore to limit concurrent Telegram API calls (prevents flood errors)
+_telegram_semaphore = asyncio.Semaphore(10)
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -1261,25 +1265,50 @@ async def get_shared_content(key: str) -> Optional[dict]:
 
 
 async def send_file_record(context: ContextTypes.DEFAULT_TYPE, chat_id: int, file_info: dict, caption: str):
-    """Send one stored Telegram file as video when playable, otherwise document."""
+    """Send one stored Telegram file as video when playable, otherwise document.
+    
+    Includes retry logic for Telegram rate limits (RetryAfter), timeouts, and
+    network errors. Uses a global semaphore to limit concurrent API calls.
+    """
     filename = file_info.get('file_name', 'file')
     ext = filename.lower().split('.')[-1] if '.' in filename else ""
+    max_retries = 5
 
-    if file_info.get('is_video') and ext in PLAYABLE_EXTS:
-        return await context.bot.send_video(
-            chat_id=chat_id,
-            video=file_info["file_id"],
-            caption=caption,
-            parse_mode="Markdown",
-            supports_streaming=True
-        )
+    for attempt in range(max_retries):
+        try:
+            async with _telegram_semaphore:
+                if file_info.get('is_video') and ext in PLAYABLE_EXTS:
+                    return await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=file_info["file_id"],
+                        caption=caption,
+                        parse_mode="Markdown",
+                        supports_streaming=True
+                    )
 
-    return await context.bot.send_document(
-        chat_id=chat_id,
-        document=file_info["file_id"],
-        caption=caption,
-        parse_mode="Markdown"
-    )
+                return await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            log.warning(f"Rate limited sending file to {chat_id}. Waiting {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+        except TimedOut:
+            wait = 2 * (attempt + 1)
+            log.warning(f"Timeout sending file to {chat_id}. Retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+        except NetworkError as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 * (attempt + 1)
+            log.warning(f"Network error sending file to {chat_id}: {e}. Retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+
+    raise RuntimeError(f"Failed to send file to {chat_id} after {max_retries} retries")
 
 
 async def send_shared_content(context: ContextTypes.DEFAULT_TYPE, chat_id: int, content: dict) -> List[Any]:
@@ -1305,7 +1334,7 @@ async def send_shared_content(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
             sent = await send_file_record(context, chat_id, file_info, caption)
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
             sent_messages.append(sent)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)
 
         return sent_messages
 
@@ -1393,7 +1422,26 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
             return False, "invalid channel identifier"
 
         log.info(f"🔍 Checking user {user_id} in channel {channel_ref}")
-        member = await bot.get_chat_member(chat_id=channel_ref, user_id=user_id)
+        
+        # Use semaphore + retry to handle rate limits under high concurrency
+        member = None
+        for attempt in range(4):
+            try:
+                async with _telegram_semaphore:
+                    member = await bot.get_chat_member(chat_id=channel_ref, user_id=user_id)
+                break
+            except RetryAfter as e:
+                wait = e.retry_after + 1
+                log.warning(f"Rate limited checking {user_id} in {clean_channel}. Waiting {wait}s (attempt {attempt+1}/4)")
+                await asyncio.sleep(wait)
+            except TimedOut:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
+        
+        if member is None:
+            return False, "rate limited after retries"
+        
         is_member = member.status in ["member", "administrator", "creator"]
         if not is_member and member.status == "restricted":
             is_member = bool(getattr(member, "is_member", False))
@@ -1422,9 +1470,15 @@ async def check_membership(
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     force_check: bool = False,
-    allow_private_requests: bool = False
+    allow_private_requests: bool = False,
+    prefetched_channels: list = None
 ) -> Dict[str, Any]:
-    """Check if user is member of all required channels"""
+    """Check if user is member of all required channels.
+    
+    Args:
+        prefetched_channels: Optional pre-fetched list from get_channels_with_details()
+                             to avoid a duplicate DB query.
+    """
     bot = context.bot
 
     result = {
@@ -1437,8 +1491,11 @@ async def check_membership(
         "verification_errors": []
     }
 
-    channels_data = await db.get_channels_with_details()
-    active_channels = [c for c in channels_data if c['is_active'] == 1]
+    if prefetched_channels is not None:
+        active_channels = [c for c in prefetched_channels if c['is_active'] == 1]
+    else:
+        channels_data = await db.get_channels_with_details()
+        active_channels = [c for c in channels_data if c['is_active'] == 1]
     
     log.info(f"📋 Found {len(active_channels)} active channels for user {user_id}")
     
@@ -1449,7 +1506,8 @@ async def check_membership(
     if force_check:
         await db.clear_membership_cache(user_id)
 
-    for channel_data in active_channels:
+    # --- Check ALL channels in parallel for speed ---
+    async def _check_one(channel_data):
         channel = channel_data['channel_username']
         channel_name = channel_data['channel_name'] or channel
         channel_id = channel_data['id']
@@ -1457,7 +1515,7 @@ async def check_membership(
         
         is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
         
-        # ADD THIS: Check for private channel request
+        # Check for private channel request
         if allow_private_requests and not is_member and channel_type == 'private':
             has_request = await db.has_private_request(user_id, channel_id)
             if has_request:
@@ -1465,6 +1523,11 @@ async def check_membership(
                 is_member = True
                 verification_error = None
         
+        return channel, channel_name, channel_id, channel_type, is_member, verification_error
+
+    check_results = await asyncio.gather(*[_check_one(cd) for cd in active_channels])
+
+    for channel, channel_name, channel_id, channel_type, is_member, verification_error in check_results:
         result["channel_status"][channel] = {
             'is_member': is_member,
             'name': channel_name,
@@ -2659,7 +2722,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = args[0]
         log.info(f"🔑 User {user_id} accessing file key: {key}")
         
-        shared_content = await get_shared_content(key)
+        # Run file lookup and membership check concurrently for speed
+        log.info(f"🔍 Checking membership for user {user_id}")
+        shared_content_task = get_shared_content(key)
+        membership_task = check_membership(
+            user_id, context, force_check=True,
+            allow_private_requests=True, prefetched_channels=active_channels
+        )
+        shared_content, result = await asyncio.gather(shared_content_task, membership_task)
 
         if not shared_content:
             log.warning(f"❌ File key {key} not found for user {user_id}")
@@ -2671,10 +2741,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info(f"File group found: {key} ({len(shared_content.get('files') or [])} files)")
         else:
             log.info(f"File found: {shared_content['file_name']}")
-
-        # Check membership with force=True
-        log.info(f"🔍 Checking membership for user {user_id}")
-        result = await check_membership(user_id, context, force_check=True, allow_private_requests=True)
 
         log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
 
@@ -3187,16 +3253,33 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_count = 0
     approve_chat_id = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
     
-    for request in pending_requests:
+    # Pre-fetch channels ONCE to avoid repeated DB queries per user
+    all_channels_data = await db.get_channels_with_details()
+    
+    for idx, request in enumerate(pending_requests):
         user_id = request['user_id']
         file_key = request['file_key']
         
         try:
+            # Approve the Telegram join request with retry for rate limits
             try:
-                await context.bot.approve_chat_join_request(
-                    chat_id=approve_chat_id,
-                    user_id=int(user_id)
-                )
+                for attempt in range(4):
+                    try:
+                        async with _telegram_semaphore:
+                            await context.bot.approve_chat_join_request(
+                                chat_id=approve_chat_id,
+                                user_id=int(user_id)
+                            )
+                        break
+                    except RetryAfter as e:
+                        wait = e.retry_after + 1
+                        log.warning(f"Rate limited approving user {user_id}. Waiting {wait}s")
+                        await asyncio.sleep(wait)
+                    except TimedOut:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(1 * (attempt + 1))
+                
                 join_approved_count += 1
                 log.info(f"Approved Telegram join request for user {user_id} in {channel_name}")
             except Exception as approve_error:
@@ -3230,12 +3313,13 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await db.clear_user_requests(user_id, db_channel_id)
                     continue
 
-            # Check if user is now a member
+            # Check if user is now a member (reuse prefetched channels)
             result = await check_membership(
                 user_id,
                 context,
                 force_check=True,
-                allow_private_requests=True
+                allow_private_requests=True,
+                prefetched_channels=all_channels_data
             )
             
             if result['all_joined']:
@@ -3285,6 +3369,20 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"❌ Error processing user {user_id}: {e}")
             failed_count += 1
+        
+        # Delay between users to avoid Telegram flood errors
+        await asyncio.sleep(0.5)
+        
+        # Update progress every 10 users
+        processed = idx + 1
+        if processed % 10 == 0 and processed < len(pending_requests):
+            try:
+                await status_msg.edit_text(
+                    f"🔄 Processing {channel_name}... {processed}/{len(pending_requests)}\n"
+                    f"✅ Sent: {approved_count} | ⏳ Waiting: {waiting_count} | ❌ Failed: {failed_count}"
+                )
+            except Exception:
+                pass
     
     # Send completion message
     sent_msg = await update.message.reply_text(
