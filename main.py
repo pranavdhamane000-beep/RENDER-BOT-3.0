@@ -186,26 +186,35 @@ class Database:
             dsn = f"dbname='{database}' user='{user}' password='{password}' host='{host}' port='{port}'"
             log.info(f"🔌 Creating connection pool to Render PostgreSQL at {host}:{port}/{database}")
 
-            try:
-                self.pool = psycopg2.pool.ThreadedConnectionPool(
-                    1, 50, dsn=dsn, connect_timeout=30,
-                    sslmode='require'
-                )
-                log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
-
-                conn = self.pool.getconn()
+            max_retries = 5
+            for attempt in range(1, max_retries + 1):
                 try:
-                    with conn.cursor() as cur:
-                        self._init_db(conn, cur)
-                finally:
-                    self.pool.putconn(conn)
+                    self.pool = psycopg2.pool.ThreadedConnectionPool(
+                        1, 50, dsn=dsn, connect_timeout=30,
+                        sslmode='require',
+                        keepalives=1,
+                        keepalives_idle=30,
+                        keepalives_interval=10,
+                        keepalives_count=5
+                    )
+                    log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
 
-                self._pool_initialized = True
-                log.info("✅ Database tables initialized/verified.")
+                    conn = self.pool.getconn()
+                    try:
+                        with conn.cursor() as cur:
+                            self._init_db(conn, cur)
+                    finally:
+                        self.pool.putconn(conn)
 
-            except Exception as e:
-                log.error(f"❌ Failed to create connection pool to Render PostgreSQL: {e}")
-                raise
+                    self._pool_initialized = True
+                    log.info("✅ Database tables initialized/verified.")
+                    break
+                except Exception as e:
+                    log.error(f"❌ Failed to create connection pool to Render PostgreSQL (Attempt {attempt}/{max_retries}): {e}")
+                    if attempt < max_retries:
+                        time.sleep(10)
+                    else:
+                        raise
         return self.pool
 
     async def _get_pool_async(self):
@@ -2055,7 +2064,7 @@ INTEGER_IMPORT_COLUMNS = {
     "id", "is_video", "access_count", "total_interactions",
     "total_files_accessed", "is_active", "position", "delete_after",
     "added_by", "message_id", "group_id", "file_db_id", "file_count",
-    "channel_id", "requested"
+    "channel_id"
 }
 
 BIGINT_IMPORT_COLUMNS = {"user_id", "chat_id", "file_size", "total_size"}
@@ -2118,6 +2127,16 @@ def convert_import_value(column: str, value: Any) -> Any:
     stripped = value.strip()
     if stripped == "" or stripped.upper() in {"NULL", "NONE"}:
         return None
+
+    if column == "requested":
+        return stripped.lower() in {"true", "1", "yes", "t", "y"}
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        import ast
+        try:
+            return ast.literal_eval(stripped)
+        except Exception:
+            pass
 
     if column in INTEGER_IMPORT_COLUMNS or column in BIGINT_IMPORT_COLUMNS:
         return int(stripped)
