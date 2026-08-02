@@ -364,6 +364,15 @@ class Database:
             )
         ''')
         
+        # Bot settings table (for tracking auto-backup timestamps, etc.)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         # Create indexes
         cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_groups_timestamp ON file_groups(timestamp)')
@@ -908,6 +917,23 @@ class Database:
         """Get total number of files."""
         result = await self.fetchrow("SELECT COUNT(*) as count FROM files")
         return result['count'] if result else 0
+
+    async def get_setting(self, key: str) -> str:
+        """Get a bot setting value by key. Returns None if not found."""
+        result = await self.fetchrow(
+            "SELECT value FROM bot_settings WHERE key = %s", (key,)
+        )
+        return result['value'] if result else None
+
+    async def set_setting(self, key: str, value: str):
+        """Set a bot setting value (upsert)."""
+        await self.execute_and_commit('''
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value,
+                updated_at = EXCLUDED.updated_at
+        ''', (key, value))
 
     async def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result."""
@@ -2381,7 +2407,9 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
                     chat_id=ADMIN_ID,
                     document=file_bytes,
                     filename=send_filename,
-                    caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines"
+                    caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines",
+                    read_timeout=120,
+                    write_timeout=120
                 )
                 
                 await asyncio.sleep(0.5)
@@ -4659,12 +4687,29 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Import failed: {str(e)[:200]}")
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Automated backup job - runs every 3 days"""
+    """Automated backup job - runs every 3 days (skips if last backup was recent)"""
+    BACKUP_INTERVAL_SECONDS = 259200  # 3 days
+    
+    # Check last backup time from database to avoid too-frequent backups on restarts
+    try:
+        last_backup = await db.get_setting('last_auto_backup')
+        if last_backup:
+            last_backup_time = datetime.fromisoformat(last_backup)
+            elapsed = (datetime.now() - last_backup_time).total_seconds()
+            if elapsed < BACKUP_INTERVAL_SECONDS:
+                remaining_hours = (BACKUP_INTERVAL_SECONDS - elapsed) / 3600
+                log.info(f"⏭️ Skipping auto-backup: last backup was {elapsed/3600:.1f}h ago, next in {remaining_hours:.1f}h")
+                return
+    except Exception as e:
+        log.warning(f"Could not check last backup time: {e}")
+    
     log.info("🔄 Running scheduled auto-backup (every 3 days)...")
     
     try:
         backup_data = await export_database_backup(update=None, context=context, send_to_admin=True)
         log.info(f"✅ Auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+        # Record successful backup time in database
+        await db.set_setting('last_auto_backup', datetime.now().isoformat())
     except Exception as e:
         log.error(f"❌ Auto-backup failed: {e}")
         try:
@@ -4705,29 +4750,48 @@ async def keepalive_loop(bot):
 
 async def auto_backup_loop(bot):
     """Fallback auto-backup loop for deployments without python-telegram-bot JobQueue."""
-    await asyncio.sleep(3600)
+    BACKUP_INTERVAL_SECONDS = 259200  # 3 days
+    CHECK_INTERVAL_SECONDS = 3600     # Check every hour
+    await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
     while True:
-        log.info("Running fallback scheduled auto-backup (every 3 days)...")
-
+        # Check last backup time from database to avoid too-frequent backups on restarts
+        should_backup = True
         try:
-            backup_data = await export_database_backup(
-                update=None,
-                context=BotOnlyContext(bot),
-                send_to_admin=True
-            )
-            log.info(f"Fallback auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+            last_backup = await db.get_setting('last_auto_backup')
+            if last_backup:
+                last_backup_time = datetime.fromisoformat(last_backup)
+                elapsed = (datetime.now() - last_backup_time).total_seconds()
+                if elapsed < BACKUP_INTERVAL_SECONDS:
+                    remaining_hours = (BACKUP_INTERVAL_SECONDS - elapsed) / 3600
+                    log.info(f"⏭️ Skipping fallback auto-backup: last backup was {elapsed/3600:.1f}h ago, next in {remaining_hours:.1f}h")
+                    should_backup = False
         except Exception as e:
-            log.error(f"Fallback auto-backup failed: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
-                )
-            except Exception:
-                pass
+            log.warning(f"Could not check last backup time in fallback loop: {e}")
 
-        await asyncio.sleep(259200)
+        if should_backup:
+            log.info("Running fallback scheduled auto-backup (every 3 days)...")
+
+            try:
+                backup_data = await export_database_backup(
+                    update=None,
+                    context=BotOnlyContext(bot),
+                    send_to_admin=True
+                )
+                log.info(f"Fallback auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+                # Record successful backup time in database
+                await db.set_setting('last_auto_backup', datetime.now().isoformat())
+            except Exception as e:
+                log.error(f"Fallback auto-backup failed: {e}")
+                try:
+                    await bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
+                    )
+                except Exception:
+                    pass
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ============ MAIN ============
 async def initialize_bot():
@@ -4746,7 +4810,12 @@ async def initialize_bot():
         log.error(f"Failed to initialize database: {e}", exc_info=True)
         return None
 
-    request = HTTPXRequest(connection_pool_size=40)
+    request = HTTPXRequest(
+        connection_pool_size=40,
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=30
+    )
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     
     await application.initialize()
@@ -4927,4 +4996,4 @@ def main():
         print("Shutdown complete.")
 
 if __name__ == "__main__":
-    main()
+    main()42w
