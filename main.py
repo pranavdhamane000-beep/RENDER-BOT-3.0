@@ -373,6 +373,36 @@ class Database:
             )
         ''')
         
+        # Polls table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS polls (
+                id SERIAL PRIMARY KEY,
+                question TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Poll Options table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS poll_options (
+                id SERIAL PRIMARY KEY,
+                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                option_text TEXT NOT NULL,
+                position INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Poll Votes table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                option_id INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
+                voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (poll_id, user_id)
+            )
+        ''')
+        
         # Create indexes
         cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_groups_timestamp ON file_groups(timestamp)')
@@ -4258,6 +4288,257 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             log.error(f"Error in broadcast confirmation: {e}")
             await query.message.reply_text(f"❌ Error starting broadcast: {str(e)[:100]}")
 
+# ============ POLL FEATURE ============
+
+async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a custom poll with inline buttons and broadcast to all users."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+        
+    import shlex
+    text = get_command_body(update.message.text or update.message.caption or "", "poll")
+    if not text:
+        await update.message.reply_text("❌ Usage: `/poll \"Your question?\" \"Option 1\" \"Option 2\" ...`\n\nExample: `/poll \"Favorite Color?\" \"Red\" \"Blue\"`", parse_mode="Markdown")
+        return
+
+    try:
+        args = shlex.split(text)
+    except Exception as e:
+        await update.message.reply_text("❌ Error parsing arguments. Make sure you match your quotes correctly.")
+        return
+
+    if len(args) < 3:
+        await update.message.reply_text("❌ A poll needs at least a question and two options.")
+        return
+
+    question = args[0]
+    options = args[1:]
+    
+    if len(question) > 1024:
+        await update.message.reply_text("❌ Question is too long.")
+        return
+        
+    for opt in options:
+        if len(opt) > 100:
+            await update.message.reply_text(f"❌ Option '{opt}' is too long (max 100 chars).")
+            return
+
+    # Insert poll into database
+    async with db.get_db_connection() as conn:
+        def _insert():
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("INSERT INTO polls (question) VALUES (%s) RETURNING id", (question,))
+                poll_id = cur.fetchone()['id']
+                
+                for i, opt in enumerate(options):
+                    cur.execute("INSERT INTO poll_options (poll_id, option_text, position) VALUES (%s, %s, %s)", (poll_id, opt, i))
+            conn.commit()
+            return poll_id
+        poll_id = await asyncio.to_thread(_insert)
+
+    # Generate the inline keyboard for the preview
+    buttons = []
+    for i, opt in enumerate(options):
+        buttons.append([InlineKeyboardButton(f"{opt} (0)", callback_data=f"poll_preview|{poll_id}")])
+    
+    confirm_data = f"confirm_poll|{poll_id}"
+    cancel_data = f"cancel_poll|{poll_id}"
+    
+    action_row = [
+        InlineKeyboardButton("✅ Confirm Broadcast", callback_data=confirm_data),
+        InlineKeyboardButton("❌ Cancel", callback_data=cancel_data)
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(buttons + [action_row])
+    
+    await update.message.reply_text(
+        f"📊 *Poll Preview*\n\n{escape_markdown(question)}",
+        parse_mode="MarkdownV2",
+        reply_markup=reply_markup
+    )
+
+async def build_poll_keyboard(poll_id: int) -> InlineKeyboardMarkup:
+    """Build the inline keyboard for a poll based on current DB state."""
+    options = await db.fetchall("SELECT id, option_text FROM poll_options WHERE poll_id = %s ORDER BY position", (poll_id,))
+    
+    keyboard = []
+    for opt in options:
+        opt_id = opt['id']
+        res = await db.fetchrow("SELECT COUNT(*) as c FROM poll_votes WHERE option_id = %s", (opt_id,))
+        count = res['c'] if res else 0
+        text = f"{opt['option_text']}" + (f" ({count})" if count > 0 else "")
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"poll_vote|{poll_id}|{opt_id}")])
+        
+    return InlineKeyboardMarkup(keyboard)
+
+async def poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle poll confirmation/cancellation"""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("You are not the admin.", show_alert=True)
+        return
+        
+    data = query.data
+    action, _, poll_id = data.partition("|")
+    poll_id = int(poll_id)
+    
+    if action == "cancel_poll":
+        await query.message.edit_text("❌ Poll broadcast cancelled.")
+        await query.answer()
+        return
+        
+    if action == "confirm_poll":
+        try:
+            question_row = await db.fetchrow("SELECT question FROM polls WHERE id = %s", (poll_id,))
+            if not question_row:
+                await query.message.edit_text("❌ Poll not found in DB.")
+                await query.answer()
+                return
+                
+            question = question_row['question']
+            user_ids = await db.get_all_user_ids(exclude_admin=True)
+            total_users = len(user_ids)
+            
+            if total_users == 0:
+                await query.message.reply_text("❌ No users found to broadcast")
+                await query.answer()
+                return
+                
+            status_msg = await query.message.reply_text(
+                f"🔄 Starting poll broadcast to {total_users} users...\n"
+                f"📦 Processing in chunks of {BROADCAST_CHUNK_SIZE} users"
+            )
+            
+            payload = {
+                "type": "poll",
+                "question": question,
+                "poll_id": poll_id
+            }
+            
+            asyncio.create_task(process_poll_broadcast_chunks(context, user_ids, payload, status_msg))
+            
+            kb = await build_poll_keyboard(poll_id)
+            await query.message.edit_reply_markup(reply_markup=kb)
+            await query.answer("Broadcast started!")
+            
+        except Exception as e:
+            log.error(f"Error starting poll broadcast: {e}")
+            await query.message.reply_text(f"❌ Error starting broadcast: {str(e)[:100]}")
+            await query.answer()
+
+async def process_poll_broadcast_chunks(context, user_ids, payload, status_msg):
+    total_users = len(user_ids)
+    total_chunks = (total_users + BROADCAST_CHUNK_SIZE - 1) // BROADCAST_CHUNK_SIZE
+    successful, failed = 0, 0
+    poll_id = payload["poll_id"]
+    question_text = f"📊 *Poll*\n\n{escape_markdown(payload['question'])}"
+    
+    reply_markup = await build_poll_keyboard(poll_id)
+    
+    for chunk_num in range(total_chunks):
+        chunk_start = chunk_num * BROADCAST_CHUNK_SIZE
+        chunk_end = min((chunk_num + 1) * BROADCAST_CHUNK_SIZE, total_users)
+        chunk = user_ids[chunk_start:chunk_end]
+        
+        for user_id in chunk:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=question_text,
+                    parse_mode="MarkdownV2",
+                    reply_markup=reply_markup
+                )
+                successful += 1
+            except Exception:
+                failed += 1
+                
+        if chunk_num % 2 == 0 or chunk_num == total_chunks - 1:
+            try:
+                prog_text = (
+                    f"🔄 Broadcasting Poll...\n"
+                    f"📦 Progress: {chunk_end}/{total_users}\n"
+                    f"✅ Success: {successful} | ❌ Failed: {failed}"
+                )
+                await status_msg.edit_text(prog_text)
+            except:
+                pass
+                
+        await asyncio.sleep(0.5)
+        
+    try:
+        await status_msg.reply_text(f"✅ *Poll Broadcast Complete!*\nSuccess: {successful}\nFailed: {failed}", parse_mode="Markdown")
+    except:
+        pass
+
+async def handle_poll_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+    
+    if data.startswith("poll_preview|"):
+        await query.answer("This is just a preview.")
+        return
+        
+    _, poll_id, option_id = data.split("|")
+    poll_id = int(poll_id)
+    option_id = int(option_id)
+    
+    try:
+        await db.execute_and_commit(
+            "INSERT INTO poll_votes (poll_id, user_id, option_id) VALUES (%s, %s, %s) ON CONFLICT (poll_id, user_id) DO UPDATE SET option_id = EXCLUDED.option_id, voted_at = CURRENT_TIMESTAMP",
+            (poll_id, user_id, option_id)
+        )
+        
+        await query.answer("Vote recorded!")
+        
+        kb = await build_poll_keyboard(poll_id)
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+            
+    except Exception as e:
+        log.error(f"Error handling vote: {e}")
+        await query.answer("Error recording vote. Please try again.")
+
+async def poll_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to view poll stats"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /poll_stats <poll_id>")
+        return
+        
+    try:
+        poll_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Poll ID must be a number.")
+        return
+        
+    poll_row = await db.fetchrow("SELECT question FROM polls WHERE id = %s", (poll_id,))
+    if not poll_row:
+        await update.message.reply_text("Poll not found.")
+        return
+        
+    question = poll_row['question']
+    options = await db.fetchall(
+        "SELECT o.option_text, COUNT(v.user_id) as count FROM poll_options o LEFT JOIN poll_votes v ON o.id = v.option_id WHERE o.poll_id = %s GROUP BY o.id ORDER BY o.position",
+        (poll_id,)
+    )
+    
+    text = f"📊 *Stats for Poll {poll_id}*\n\nQuestion: {escape_markdown(question)}\n\n"
+    total_votes = 0
+    for opt in options:
+        c = opt['count']
+        total_votes += c
+        text += f"• {escape_markdown(opt['option_text'])}: {c} votes\n"
+        
+    text += f"\n*Total Votes: {total_votes}*"
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache (admin only)"""
     if update.effective_user.id != ADMIN_ID:
@@ -4867,6 +5148,8 @@ async def initialize_bot():
     application.add_handler(CommandHandler("deletefile", deletefile))
     application.add_handler(CommandHandler("users", users))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("poll", poll_cmd))
+    application.add_handler(CommandHandler("poll_stats", poll_stats_cmd))
     application.add_handler(CommandHandler("clearcache", clearcache))
     
     # Channel management commands
@@ -4885,6 +5168,8 @@ async def initialize_bot():
     # Add callback handlers
     application.add_handler(CallbackQueryHandler(callback_handler, pattern="^(status\\|)|^(noop)$"))
     application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)(\\|.+)?$"))
+    application.add_handler(CallbackQueryHandler(poll_action_callback, pattern="^(confirm_poll|cancel_poll)\\|"))
+    application.add_handler(CallbackQueryHandler(handle_poll_vote, pattern="^(poll_vote|poll_preview)\\|"))
     application.add_handler(CallbackQueryHandler(import_callback, pattern="^(confirm_import|cancel_import)$"))
 
     # Add upload handler (admin only)
