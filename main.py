@@ -4337,6 +4337,7 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         poll_id = await asyncio.to_thread(_insert)
 
     # Generate the inline keyboard for the preview
+    # Admin preview will show counts (which are 0 right now)
     buttons = []
     for i, opt in enumerate(options):
         buttons.append([InlineKeyboardButton(f"{opt} (0)", callback_data=f"poll_preview|{poll_id}")])
@@ -4357,16 +4358,29 @@ async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-async def build_poll_keyboard(poll_id: int) -> InlineKeyboardMarkup:
+async def build_poll_keyboard(poll_id: int, user_id: int = None, show_counts: bool = False) -> InlineKeyboardMarkup:
     """Build the inline keyboard for a poll based on current DB state."""
     options = await db.fetchall("SELECT id, option_text FROM poll_options WHERE poll_id = %s ORDER BY position", (poll_id,))
     
+    user_vote_id = None
+    if user_id:
+        vote_row = await db.fetchrow("SELECT option_id FROM poll_votes WHERE poll_id = %s AND user_id = %s", (poll_id, user_id))
+        if vote_row:
+            user_vote_id = vote_row['option_id']
+            
     keyboard = []
     for opt in options:
         opt_id = opt['id']
-        res = await db.fetchrow("SELECT COUNT(*) as c FROM poll_votes WHERE option_id = %s", (opt_id,))
-        count = res['c'] if res else 0
-        text = f"{opt['option_text']}" + (f" ({count})" if count > 0 else "")
+        text = opt['option_text']
+        
+        if show_counts:
+            res = await db.fetchrow("SELECT COUNT(*) as c FROM poll_votes WHERE option_id = %s", (opt_id,))
+            count = res['c'] if res else 0
+            text += f" ({count})"
+            
+        if user_vote_id == opt_id:
+            text = f"✅ {text}"
+            
         keyboard.append([InlineKeyboardButton(text, callback_data=f"poll_vote|{poll_id}|{opt_id}")])
         
     return InlineKeyboardMarkup(keyboard)
@@ -4417,7 +4431,7 @@ async def poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             
             asyncio.create_task(process_poll_broadcast_chunks(context, user_ids, payload, status_msg))
             
-            kb = await build_poll_keyboard(poll_id)
+            kb = await build_poll_keyboard(poll_id, show_counts=True)
             await query.message.edit_reply_markup(reply_markup=kb)
             await query.answer("Broadcast started!")
             
@@ -4433,7 +4447,7 @@ async def process_poll_broadcast_chunks(context, user_ids, payload, status_msg):
     poll_id = payload["poll_id"]
     question_text = f"📊 *Poll*\n\n{escape_markdown(payload['question'])}"
     
-    reply_markup = await build_poll_keyboard(poll_id)
+    reply_markup = await build_poll_keyboard(poll_id, show_counts=False)
     
     for chunk_num in range(total_chunks):
         chunk_start = chunk_num * BROADCAST_CHUNK_SIZE
@@ -4491,7 +4505,13 @@ async def handle_poll_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.answer("Vote recorded!")
         
-        kb = await build_poll_keyboard(poll_id)
+        # Determine if we should show counts (only if it's the admin clicking their own preview)
+        # Actually, let's just always hide counts on the broadcasted message, and add a checkmark for the user.
+        # But if the admin taps the preview message, they should probably see counts.
+        # We can figure out if it's the preview message by checking if user_id == ADMIN_ID.
+        # Let's just do user_id=ADMIN_ID gets counts to keep it simple.
+        show_counts = (user_id == ADMIN_ID)
+        kb = await build_poll_keyboard(poll_id, user_id=user_id, show_counts=show_counts)
         try:
             await query.message.edit_reply_markup(reply_markup=kb)
         except Exception:
